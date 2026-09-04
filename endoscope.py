@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Endoscope viewer with a 3D aim indicator  (v6)
+Endoscope viewer with a 3D aim indicator  (v6.0.1)
 ----------------------------------------------
 Fullscreen video from the AtomS3R-CAM probe plus a compass showing where the
 lens is aimed, for work where the probe is out of sight.
@@ -9,7 +9,7 @@ lens is aimed, for work where the probe is out of sight.
     python3 endoscope.py --windowed         # development on a desktop
     python3 endoscope.py --sim --windowed   # no hardware at all: synthetic probe
     python3 endoscope.py --port /dev/ttyACM0
-    python3 endoscope.py --usb-composite    # v6: UVC + IMU on one USB-C cable
+    python3 endoscope.py --usb-composite    # v6.0.1: one USB-C cable, no Wi-Fi
     python3 endoscope.py --official         # fallback: stock UVC + IMU WiFi
     python3 endoscope.py --log drift.csv    # record az/el vs time for analysis
 
@@ -72,7 +72,7 @@ WHAT v3 FIXES OVER v2 (v2 was written but never ran)
 
 SETUP ON THE PI
     sudo apt install python3-serial python3-opencv python3-pil.imagetk python3-numpy -y
-    sudo usermod -aG dialout $USER      # then REBOOT
+    sudo usermod -aG video,dialout $USER    # then REBOOT
 """
 import argparse
 import base64
@@ -83,6 +83,7 @@ import json
 import math
 import os
 import socket
+import subprocess
 import struct
 import sys
 import threading
@@ -118,7 +119,7 @@ from PIL import Image, ImageTk
 
 CONFIG = os.path.join(os.path.expanduser("~"), ".config", "endoscope.json")
 SYNC = b"\xa5\x5a"
-APP_VER = "6.0"
+APP_VER = "6.0.1"
 CONFIG_REV = 6
 
 # v6 binary telemetry is one fixed, checksummed record.  A fixed record is
@@ -618,7 +619,7 @@ def find_usb_imu_port(preferred=None):
 
 
 def find_video(preferred="auto"):
-    """Resolve a V4L2 node, preferring the AtomS3R-CAM by its kernel name."""
+    """Resolve the Atom capture node and reject metadata-only video nodes."""
     if preferred not in (None, "", "auto"):
         return int(preferred) if str(preferred).isdigit() else preferred
 
@@ -641,6 +642,25 @@ def find_video(preferred="auto"):
             score += 100
         if "uvc" in name or "camera" in name:
             score += 10
+        if "metadata" in name:
+            score -= 500
+
+        # UVC commonly exposes adjacent capture and metadata nodes. Prefer the
+        # node that actually advertises MJPEG instead of breaking a name tie by
+        # node number. install_pi.sh installs v4l2-ctl for this probe.
+        try:
+            probe = subprocess.run(
+                ["v4l2-ctl", "--device", node, "--list-formats-ext"],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                text=True, timeout=2.0, check=False)
+            formats = probe.stdout.upper()
+            if "MJPG" in formats or "MJPEG" in formats:
+                score += 300
+            elif probe.returncode == 0:
+                score -= 100
+        except (OSError, subprocess.SubprocessError):
+            # Name-only ranking remains available on minimal systems.
+            pass
         ranked.append((score, node))
     return max(ranked, key=lambda item: (item[0], -int(item[1][10:])))[1]
 
@@ -662,6 +682,7 @@ class V4L2Source:
     """
 
     def __init__(self, index="auto", width=640, height=480):
+        self.requested_index = index
         self.index = index
         self.want = (width, height)
         self.cap = None
@@ -670,45 +691,105 @@ class V4L2Source:
         self.frame_seq = 0
         self.frame_time = 0.0
         self.running = False
+        self.online = False
         self.error = None
+        self.thread = None
+        self.reconnects = 0
         self._fps = []
 
-    def start(self):
-        src = find_video(self.index)
+    def _open_capture(self):
+        """Open/configure a V4L2 handle only from the reader thread."""
+        src = find_video(self.requested_index)
         if src is None:
             raise RuntimeError("no /dev/video device found; flash the v6 UVC+IMU "
                                "firmware and reconnect USB")
         self.index = src
-        self.cap = cv2.VideoCapture(src, cv2.CAP_V4L2)
-        if not self.cap.isOpened():
+        cap = cv2.VideoCapture(src, cv2.CAP_V4L2)
+        if not cap.isOpened():
+            cap.release()
             raise RuntimeError("cannot open camera {}. Try: ls /dev/video*"
                                .format(self.index))
         # MJPG first: at 720p a YUYV stream will not fit down USB 2.0 at a
         # usable frame rate, and most UVC cameras offer both.
-        self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.want[0])
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.want[1])
-        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-        ok, _ = self.cap.read()
-        if not ok:
-            raise RuntimeError("camera {} opened but returns no frames"
-                               .format(self.index))
+        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.want[0])
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.want[1])
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        return cap
+
+    def start(self):
+        # VideoCapture creation, read and release all happen in this worker.
+        # Releasing from Tk while V4L2 is blocked in select() caused the
+        # observed OpenCV `alloc: invalid block` process abort.
+        if self.running:
+            return self
         self.running = True
-        threading.Thread(target=self._loop, daemon=True).start()
+        self.thread = threading.Thread(target=self._loop, daemon=True,
+                                       name="uvc-reader")
+        self.thread.start()
         return self
 
     def _loop(self):
-        while self.running:
-            ok, frame = self.cap.read()
-            if not ok:
-                time.sleep(0.05)
-                continue
-            now = time.monotonic()
-            with self.lock:
-                self.frame = frame
-                self.frame_seq += 1
-                self.frame_time = now
-                self._fps.append(now)
+        try:
+            while self.running:
+                if self.cap is None:
+                    try:
+                        self.cap = self._open_capture()
+                        self.error = None
+                    except Exception as exc:
+                        self.online = False
+                        self.error = str(exc)
+                        time.sleep(1.0)
+                        continue
+
+                try:
+                    ok, frame = self.cap.read()
+                except Exception as exc:
+                    # Some OpenCV builds raise instead of returning False on
+                    # USB removal. Treat both forms as the same recoverable
+                    # stream failure and keep all handle operations here.
+                    ok, frame = False, None
+                    self.error = "camera read failed: {}".format(exc)
+                if not self.running:
+                    break
+                if not ok:
+                    # A timed-out V4L2 handle is often no longer usable. The
+                    # same worker releases and reopens it, which is safe for
+                    # OpenCV and also recovers automatically after USB replug.
+                    self.online = False
+                    if self.error is None:
+                        self.error = ("camera read timeout; reopening {}"
+                                      .format(self.index))
+                    try:
+                        self.cap.release()
+                    except Exception:
+                        pass
+                    self.cap = None
+                    self.reconnects += 1
+                    # Never leave a frozen old frame looking like live video.
+                    with self.lock:
+                        self.frame = None
+                        self._fps = []
+                    time.sleep(0.5)
+                    continue
+
+                now = time.monotonic()
+                self.online = True
+                self.error = None
+                with self.lock:
+                    self.frame = frame
+                    self.frame_seq += 1
+                    self.frame_time = now
+                    self._fps.append(now)
+        finally:
+            # The reader is the sole VideoCapture owner, including shutdown.
+            if self.cap is not None:
+                try:
+                    self.cap.release()
+                except Exception:
+                    pass
+                self.cap = None
+            self.online = False
 
     def fps(self):
         now = time.monotonic()
@@ -722,9 +803,12 @@ class V4L2Source:
 
     def stop(self):
         self.running = False
-        time.sleep(0.05)
-        if self.cap:
-            self.cap.release()
+        if self.thread is not None:
+            # OpenCV's V4L2 select timeout is about ten seconds. Waiting only
+            # matters for a broken stream and prevents a cross-thread free.
+            self.thread.join(timeout=12.0)
+            if not self.thread.is_alive():
+                self.thread = None
 
 
 class UsbImuPacketParser:
@@ -797,7 +881,7 @@ class UsbImuPacketParser:
 
 
 class UsbCompositeProbeLink:
-    """v6 transport: UVC pixels and fused IMU records over one USB-C cable.
+    """v6.0.1 transport: UVC pixels and fused IMU over one USB-C cable.
 
     Linux binds the UVC interface to `/dev/video*` and the CDC ACM interface to
     `/dev/ttyACM*`.  They are two interfaces of the same physical device, not
@@ -822,7 +906,7 @@ class UsbCompositeProbeLink:
         self.dropped_packets = 0
         self.state = "searching"
         self.fw = "usb_uvc_cdc_v6"
-        self.fw_ver = (6, 0)
+        self.fw_ver = (6, 0, 1)
         self.calib_ok = None
         self.calibrating = True
         self.camera_failed = False
@@ -843,11 +927,9 @@ class UsbCompositeProbeLink:
         self.reg_ack = None
 
     def start(self):
-        try:
-            self.camera.start()
-        except Exception as exc:
-            self.camera_failed = True
-            self.status.append({"status": "uvc_failed", "error": str(exc)})
+        # Camera discovery and re-open are asynchronous, so the UI can remain
+        # alive while the composite device is unplugged and reconnected.
+        self.camera.start()
         self.running = True
         threading.Thread(target=self._manager, daemon=True).start()
         return self
@@ -957,12 +1039,14 @@ class UsbCompositeProbeLink:
                 "calib_ok": self.calib_ok,
                 "raw_seq": 0,
                 "calibrating": self.calibrating,
-                "camera_failed": self.camera_failed,
+                "camera_failed": not self.camera.online,
                 "generation": self.generation,
                 "imu_age": now - self.imu_time if self.imu_time else 1e9,
                 "frame_age": (now - self.camera.frame_time
                               if self.camera.frame_time else 1e9),
                 "fps": self.camera.fps(),
+                "camera_error": self.camera.error,
+                "camera_reconnects": self.camera.reconnects,
                 "bad": self.bad_packets,
                 "dropped": self.dropped_packets,
                 "port": self.port,
@@ -1692,12 +1776,14 @@ class OfficialProbeLink:
                     "regs_seq": 0, "reg_ack": None, "raw_stream": False,
                     "test_pattern": False, "calib_ok": self.calib_ok,
                     "raw_seq": 0, "calibrating": self.calibrating,
-                    "camera_failed": self.camera_failed,
+                    "camera_failed": not self.camera.online,
                     "generation": self.generation,
                     "imu_age": now - self.imu_time if self.imu_time else 1e9,
                     "frame_age": (now - self.camera.frame_time
                                   if self.camera.frame_time else 1e9),
                     "fps": self.camera.fps(), "bad": self.bad_packets,
+                    "camera_error": self.camera.error,
+                    "camera_reconnects": self.camera.reconnects,
                     "port": self.imu_url}
 
     def send_bytes(self, _):
@@ -2428,7 +2514,7 @@ class App:
             text="PROBE: \u2026", fill=DIM, font=self.f(small))
         z.append(self.setup_status)
         z.append(c.create_text(W - max(10, H // 46), H - max(10, H // 46),
-                               anchor="se", text="app v" + APP_VER,
+                               anchor="se", text="USB-C host app v" + APP_VER,
                                fill=MUTED, font=self.f(small)))
 
     def do_zero(self):
@@ -2831,7 +2917,10 @@ class App:
             if h["state"] == "offline":
                 return ("PROBE: USB IMU offline — reconnect the Type-C cable", ALERT)
             if h["camera_failed"]:
-                return ("PROBE: USB IMU online, UVC missing — check /dev/video*", WARN)
+                retries = h.get("camera_reconnects", 0)
+                return ("PROBE: USB IMU online; UVC reconnecting"
+                        + (" ({})".format(retries) if retries else "")
+                        + " — check /dev/video*", WARN)
             if h["calibrating"]:
                 return ("PROBE: USB video online; calibrating gyro — hold it still...", WARN)
             return "PROBE: one-cable USB video + IMU online", OK
@@ -3068,7 +3157,7 @@ class App:
                 self.nosignal,
                 state="normal" if stale else "hidden",
                 text=("PROBE DISCONNECTED" if h["state"] != "online"
-                      else "NO VIDEO SIGNAL"))
+                      else "UVC RECONNECTING — KEEP USB-C CONNECTED"))
             if stale and self.photo is not None:
                 self.canvas.itemconfigure(self.video_item, image="")
                 self.photo = None
@@ -3085,6 +3174,8 @@ class App:
                 bits.append("V-FLIP")
             if getattr(self.link, "is_usb_composite", False):
                 bits.append("USB UVC+IMU")
+                if h.get("camera_reconnects"):
+                    bits.append("UVC retry {}".format(h["camera_reconnects"]))
             elif uvc:
                 bits.append("OFFICIAL UVC")
             elif self.awb:
@@ -4045,7 +4136,7 @@ def main():
                     help="use M5Stack stock firmware: UVC video plus raw IMU from "
                          "ws://192.168.4.1; no custom colour path")
     ap.add_argument("--usb-composite", "--usb", action="store_true",
-                    help="v6 recommended mode: UVC video and fused IMU over the "
+                    help="v6.0.1 recommended mode: UVC video and fused IMU over the "
                          "same USB-C cable; no Wi-Fi")
     ap.add_argument("--imu-ws", default="ws://192.168.4.1/api/v1/ws/imu_data",
                     help="stock-firmware IMU WebSocket URL")

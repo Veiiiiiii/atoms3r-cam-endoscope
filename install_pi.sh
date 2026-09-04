@@ -8,7 +8,8 @@ sudo apt-get install -y \
     python3-opencv \
     python3-pil.imagetk \
     python3-numpy \
-    v4l-utils
+    v4l-utils \
+    usbutils
 
 # Group changes take effect at the next login; a reboot is the clearest step.
 sudo usermod -aG video,dialout "${USER}"
