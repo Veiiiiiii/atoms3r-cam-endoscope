@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Hardware-free regression tests for the endoscope transport and fusion."""
+"""Hardware-free regression tests for v6 transport, fusion and video flips."""
 
 import importlib.util
 import json
@@ -7,21 +7,29 @@ import math
 import socket
 import sys
 import types
+import zlib
 from pathlib import Path
+
+import numpy as np
 
 
 HERE = Path(__file__).resolve().parent
 
 
 def load_app():
-    # The Raspberry Pi installs these packages. CI for the protocol/fusion does
-    # not need a display or image decoder, so provide inert import stubs.
+    """Load the application without requiring a display or camera device."""
     serial = types.ModuleType("serial")
     serial.Serial = object
     sys.modules.setdefault("serial", serial)
 
     cv2 = types.ModuleType("cv2")
     cv2.CAP_V4L2 = 200
+    cv2.ROTATE_180 = 1
+    cv2.rotate = lambda image, _: np.rot90(image, 2).copy()
+    cv2.flip = lambda image, code: (
+        image[::-1, ::-1].copy() if code == -1 else
+        image[:, ::-1].copy() if code == 1 else
+        image[::-1].copy())
     sys.modules.setdefault("cv2", cv2)
 
     tk = types.ModuleType("tkinter")
@@ -49,7 +57,40 @@ def load_app():
     return module
 
 
-def test_packet_parser(app):
+def make_usb_packet(app, sequence=7, flags=0x0d, quaternion=(1, 0, 0, 0)):
+    """Build exactly the record emitted by firmware/service_usb_imu.cpp."""
+    without_crc = app.USB_IMU_PACKET.pack(
+        app.USB_IMU_MAGIC, app.USB_IMU_VERSION, flags,
+        app.USB_IMU_PACKET.size, sequence, 123456789,
+        0.1, -0.2, 0.98, 1.2, -2.3, 3.4, 10.0, 20.0, 30.0,
+        *quaternion, 0)
+    crc = zlib.crc32(without_crc[:-4]) & 0xffffffff
+    return without_crc[:-4] + crc.to_bytes(4, "little")
+
+
+def test_usb_packet_parser(app):
+    assert app.USB_IMU_PACKET.size == 76
+    parser = app.UsbImuPacketParser()
+    valid = make_usb_packet(app)
+
+    # Noise, a corrupted record, and split reads must all recover at the next
+    # magic word. This models reconnect boot text and arbitrary CDC chunks.
+    corrupt = bytearray(valid)
+    corrupt[25] ^= 0x80
+    assert parser.feed(b"boot noise" + bytes(corrupt[:31])) == []
+    records = parser.feed(bytes(corrupt[31:]) + valid[:9])
+    assert records == []
+    records = parser.feed(valid[9:])
+    assert len(records) == 1
+    record = records[0]
+    assert record["sequence"] == 7
+    assert record["flags"] == 0x0d
+    assert abs(sum(v * v for v in record["quaternion"]) - 1.0) < 1e-6
+    assert parser.bad_packets == 1
+
+
+def test_legacy_packet_parser(app):
+    """The older serial mode remains available as a diagnostic fallback."""
     link = app.ProbeLink()
     payload = json.dumps({"q": [1, 0, 0, 0]}).encode()
     checksum = 0
@@ -63,9 +104,9 @@ def test_packet_parser(app):
 
 
 def test_fusion(app):
+    """Keep the stock-WiFi fallback's host-side fusion covered."""
     fusion = app.MahonyFusion()
     t = 100.0
-    # A stationary non-zero gyro offset must be calibrated away.
     for _ in range(40):
         fusion.update((0.0, 0.0, 1.0), (0.4, -0.3, 0.2), t)
         t += 0.1
@@ -73,7 +114,6 @@ def test_fusion(app):
     assert fusion.still
     assert max(abs(a - b) for a, b in zip(fusion.bias, (0.4, -0.3, 0.2))) < 0.03
 
-    # One second at +90 dps around body Z should produce about +90 degrees yaw.
     for _ in range(10):
         fusion.update((0.0, 0.0, 1.0), (0.4, -0.3, 90.2), t)
         t += 0.1
@@ -97,23 +137,42 @@ def test_websocket_frame(app):
         server.close()
 
 
-def test_firmware_uses_official_path():
-    source = (HERE / "atoms3r_cam_imu.ino").read_text(encoding="utf-8")
-    production = source.split("if (mode == 0)", 1)[1].split("else if", 1)[0]
-    startup = source.split("bool startCamera()", 1)[1].split("static uint8_t *rgbBuf", 1)[0]
-    assert "frame2jpg(fb, JPEG_QUALITY" in production
-    assert "set_whitebal" not in startup
-    assert "char rdy[128]" in source
-    assert r'\"video\":\"official_frame2jpg\"' in source
+def test_video_flips_are_independent(app):
+    image = np.arange(12, dtype=np.uint8).reshape(2, 2, 3)
+    viewer = object.__new__(app.App)
+    viewer.rot180 = False
+    viewer.video_flip_h = True
+    viewer.video_flip_v = False
+    assert np.array_equal(viewer._apply_video_orientation(image), image[:, ::-1])
+    viewer.video_flip_h = False
+    viewer.video_flip_v = True
+    assert np.array_equal(viewer._apply_video_orientation(image), image[::-1])
+    viewer.video_flip_h = True
+    assert np.array_equal(viewer._apply_video_orientation(image), image[::-1, ::-1])
+
+
+def test_firmware_composite_contract():
+    """Static checks catch accidental removal of the one-cable architecture."""
+    descriptor = (HERE / "firmware/components/usb_device_uvc/tusb/usb_descriptors.c").read_text()
+    config = (HERE / "firmware/components/usb_device_uvc/tusb/tusb_config.h").read_text()
+    service = (HERE / "firmware/main/service/service_usb_imu.cpp").read_text()
+    main = (HERE / "firmware/main/usb_webcam_main.cpp").read_text()
+    assert "TUD_CDC_DESCRIPTOR" in descriptor
+    assert "#define CFG_TUD_CDC" in config and " 1" in config
+    assert "static_assert(sizeof(ImuPacketV1) == 76" in service
+    assert "start_service_usb_imu();" in main
+    assert "start_service_web_server();" not in main
 
 
 def main():
     app = load_app()
-    test_packet_parser(app)
+    test_usb_packet_parser(app)
+    test_legacy_packet_parser(app)
     test_fusion(app)
     test_websocket_frame(app)
-    test_firmware_uses_official_path()
-    print("PASS: packet parser, Mahony fusion, WebSocket frames, official video path")
+    test_video_flips_are_independent(app)
+    test_firmware_composite_contract()
+    print("PASS: USB packet recovery, fallback fusion, WebSocket, flips, firmware contract")
 
 
 if __name__ == "__main__":
