@@ -77,11 +77,14 @@ SETUP ON THE PI
 import argparse
 import base64
 import csv
+import errno
+import fcntl
 import glob
 import hashlib
 import json
 import math
 import os
+import signal
 import socket
 import subprocess
 import struct
@@ -119,8 +122,28 @@ from PIL import Image, ImageTk
 
 CONFIG = os.path.join(os.path.expanduser("~"), ".config", "endoscope.json")
 SYNC = b"\xa5\x5a"
-APP_VER = "6.0.1"
+APP_VER = "6.0.2"
 CONFIG_REV = 6
+
+# One running instance owns /dev/video* and /dev/ttyACM*. A second launch that
+# starts while the first is still shutting down finds the nodes busy and shows
+# no picture, which looked like "it only works the first time".
+RUNLOCK = os.path.join(os.path.expanduser("~"), ".cache", "endoscope.lock")
+
+# The v6 firmware advertises QVGA 320x240 @30 first and VGA 640x480 @15 second
+# (firmware/sdkconfig, CONFIG_UVC_CAM1_FRAMESIZE_* and CONFIG_UVC_MULTI_FRAME_*).
+# ESP32-S3 USB is full speed only, and the isochronous budget is shared with the
+# CDC IMU interface, so a VGA request negotiates successfully and then starves:
+# the measured result was 2 fps, followed by a stalled stream that OpenCV only
+# reports after its ~10 s V4L2 select timeout. That is the "works for ten
+# seconds, then NO SIGNAL" fault. QVGA is the size the device can actually
+# deliver, and the Pi upscales it for free.
+CAPTURE_LADDER = [(320, 240), (480, 320), (640, 480)]
+DEFAULT_CAPTURE = "320x240"
+
+# A stream that produces nothing for this long is treated as dead and the
+# handle is reopened, instead of waiting out OpenCV's ~10 s select timeout.
+FRAME_WATCHDOG_S = 2.5
 
 # v6 binary telemetry is one fixed, checksummed record.  A fixed record is
 # cheaper to parse than JSON and, unlike newline framing, recovers cleanly if a
@@ -559,6 +582,104 @@ def analyze_bars(raw, width, height):
 
 # ------------------------------------------------------------- serial link
 
+def device_holders(patterns=("/dev/video*", "/dev/ttyACM*")):
+    """PIDs other than ours with one of these device nodes open.
+
+    /proc is the only dependency-free way to answer "is the camera still busy",
+    and the answer is what decides whether a relaunch will show a picture.
+    """
+    wanted = set()
+    for pattern in patterns:
+        wanted.update(os.path.realpath(p) for p in glob.glob(pattern))
+    if not wanted:
+        return []
+    me = os.getpid()
+    holders = []
+    for entry in glob.glob("/proc/[0-9]*/fd"):
+        try:
+            pid = int(entry.split("/")[2])
+        except (IndexError, ValueError):
+            continue
+        if pid == me:
+            continue
+        try:
+            for fd in os.listdir(entry):
+                try:
+                    target = os.readlink(os.path.join(entry, fd))
+                except OSError:
+                    continue
+                if target in wanted:
+                    holders.append(pid)
+                    break
+        except OSError:
+            # The process exited between listing and reading; nothing to do.
+            continue
+    return holders
+
+
+def claim_single_instance(timeout=8.0):
+    """Become the only Endoscope, ending any earlier one that is still up.
+
+    Closing the window and immediately relaunching used to fail: the previous
+    process could still be blocked inside a V4L2 read, holding /dev/video0, so
+    the new process found the camera busy and sat on NO SIGNAL. Taking the lock
+    first -- and ending whoever holds it -- makes a relaunch deterministic.
+    """
+    try:
+        os.makedirs(os.path.dirname(RUNLOCK), exist_ok=True)
+        handle = open(RUNLOCK, "a+", encoding="utf-8")
+    except OSError:
+        return None                      # Read-only home: run unguarded.
+
+    deadline = time.monotonic() + timeout
+    escalated = False
+    while True:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            handle.seek(0)
+            handle.truncate()
+            handle.write(str(os.getpid()))
+            handle.flush()
+            return handle               # Held open for the process lifetime.
+        except OSError as exc:
+            if exc.errno not in (errno.EACCES, errno.EAGAIN):
+                return None
+        try:
+            handle.seek(0)
+            other = int((handle.read() or "0").strip() or 0)
+        except (OSError, ValueError):
+            other = 0
+        if other > 0 and other != os.getpid():
+            sig = signal.SIGKILL if escalated else signal.SIGTERM
+            try:
+                os.kill(other, sig)
+                print("endoscope: {} previous instance pid {}".format(
+                    "killed" if escalated else "asked to exit", other))
+            except ProcessLookupError:
+                pass
+            except PermissionError:
+                break                   # Another user's process; leave it be.
+        if time.monotonic() > deadline:
+            break
+        if time.monotonic() > deadline - timeout / 2:
+            escalated = True
+        time.sleep(0.25)
+    print("endoscope: could not take the run lock; continuing anyway",
+          file=sys.stderr)
+    return None
+
+
+def wait_for_free_camera(timeout=6.0):
+    """Give a dying predecessor time to let go of /dev/video*."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        holders = device_holders(("/dev/video*",))
+        if not holders:
+            return True
+        time.sleep(0.25)
+    return False
+
+
 def find_port(preferred=None):
     if preferred:
         return preferred if os.path.exists(preferred) else None
@@ -681,10 +802,21 @@ class V4L2Source:
     attitude, none of that code runs at all.
     """
 
-    def __init__(self, index="auto", width=640, height=480):
+    def __init__(self, index="auto", width=320, height=240):
         self.requested_index = index
         self.index = index
         self.want = (width, height)
+        # Sizes to try, largest request first, always ending at the size the
+        # firmware lists as its primary format.
+        self.ladder = [(width, height)]
+        for size in CAPTURE_LADDER:
+            if size not in self.ladder and size <= (width, height):
+                self.ladder.append(size)
+        if CAPTURE_LADDER[0] not in self.ladder:
+            self.ladder.append(CAPTURE_LADDER[0])
+        self.rung = 0
+        self.actual = None              # size the driver actually negotiated
+        self.stalls = 0
         self.cap = None
         self.lock = threading.Lock()
         self.frame = None
@@ -703,19 +835,46 @@ class V4L2Source:
         if src is None:
             raise RuntimeError("no /dev/video device found; flash the v6 UVC+IMU "
                                "firmware and reconnect USB")
+        busy = device_holders(("/dev/video*",))
+        if busy:
+            raise RuntimeError("camera busy: pid {} still has it open"
+                               .format(", ".join(str(p) for p in busy)))
         self.index = src
         cap = cv2.VideoCapture(src, cv2.CAP_V4L2)
         if not cap.isOpened():
             cap.release()
             raise RuntimeError("cannot open camera {}. Try: ls /dev/video*"
                                .format(self.index))
-        # MJPG first: at 720p a YUYV stream will not fit down USB 2.0 at a
-        # usable frame rate, and most UVC cameras offer both.
+        want = self.ladder[min(self.rung, len(self.ladder) - 1)]
+        # MJPG first: an ESP32-S3 is full speed only, and a raw YUYV stream
+        # would not fit down the wire at any usable frame rate.
         cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.want[0])
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.want[1])
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, want[0])
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, want[1])
         cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        try:
+            got = (int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0),
+                   int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0))
+        except Exception:
+            # Reading back the negotiated size is diagnostic, not essential.
+            # A backend that cannot answer must not turn into a failed open.
+            got = (0, 0)
+        self.actual = got if got[0] > 16 and got[1] > 16 else want
+        print("endoscope: camera {} at {}x{} (asked {}x{})".format(
+            self.index, self.actual[0], self.actual[1], want[0], want[1]))
         return cap
+
+    def _step_down(self):
+        """Ask for less after a stall; a starved ISO stream never recovers.
+
+        Renegotiating a smaller frame size also re-selects the isochronous
+        alternate setting, which is what actually restarts a wedged ESP32 UVC
+        endpoint. Reopening at the same size usually wedges again.
+        """
+        if self.rung < len(self.ladder) - 1:
+            self.rung += 1
+            print("endoscope: stream stalled; dropping to {}x{}".format(
+                *self.ladder[self.rung]))
 
     def start(self):
         # VideoCapture creation, read and release all happen in this worker.
@@ -730,16 +889,45 @@ class V4L2Source:
         return self
 
     def _loop(self):
+        opened_at = 0.0
+        frames_since_open = 0
         try:
             while self.running:
                 if self.cap is None:
                     try:
                         self.cap = self._open_capture()
                         self.error = None
+                        opened_at = time.monotonic()
+                        frames_since_open = 0
                     except Exception as exc:
                         self.online = False
                         self.error = str(exc)
                         time.sleep(1.0)
+                        continue
+
+                # Acceptance test. A size the device advertises but cannot
+                # carry does open, delivers a couple of frames and then dies
+                # ten seconds later inside select(). Judging the negotiated
+                # size on its first few seconds catches that immediately
+                # instead of after the operator has already lost the picture.
+                if (frames_since_open and opened_at
+                        and time.monotonic() - opened_at > 4.0):
+                    rate = frames_since_open / (time.monotonic() - opened_at)
+                    opened_at = 0.0     # judge once per open
+                    if rate < 5.0 and self.rung < len(self.ladder) - 1:
+                        self.error = ("{:.1f} fps at {}x{} is below what this "
+                                      "link can hold".format(
+                                          rate, *(self.actual or (0, 0))))
+                        self._step_down()
+                        try:
+                            self.cap.release()
+                        except Exception:
+                            pass
+                        self.cap = None
+                        self.reconnects += 1
+                        with self.lock:
+                            self.frame = None
+                            self._fps = []
                         continue
 
                 try:
@@ -760,6 +948,13 @@ class V4L2Source:
                     if self.error is None:
                         self.error = ("camera read timeout; reopening {}"
                                       .format(self.index))
+                    self.stalls += 1
+                    # Two stalls in a row is not bad luck, it is a size this
+                    # link cannot sustain. Reopening at the same size would
+                    # simply stall again in another ten seconds.
+                    if self.stalls >= 2:
+                        self._step_down()
+                        self.stalls = 0
                     try:
                         self.cap.release()
                     except Exception:
@@ -776,6 +971,8 @@ class V4L2Source:
                 now = time.monotonic()
                 self.online = True
                 self.error = None
+                self.stalls = 0
+                frames_since_open += 1
                 with self.lock:
                     self.frame = frame
                     self.frame_seq += 1
@@ -801,12 +998,16 @@ class V4L2Source:
         with self.lock:
             return self.frame, self.frame_seq, self.frame_time
 
-    def stop(self):
+    def stop(self, timeout=1.5):
         self.running = False
         if self.thread is not None:
-            # OpenCV's V4L2 select timeout is about ten seconds. Waiting only
-            # matters for a broken stream and prevents a cross-thread free.
-            self.thread.join(timeout=12.0)
+            # A healthy reader returns within one frame time. A reader blocked
+            # in OpenCV's ~10 s V4L2 select would hold /dev/video0 for that
+            # whole time, and the relaunch that arrives two seconds later then
+            # finds the camera busy. So the wait here is short and main() ends
+            # the process outright afterwards: process exit closes the file
+            # descriptor immediately, which is the only guaranteed release.
+            self.thread.join(timeout=timeout)
             if not self.thread.is_alive():
                 self.thread = None
 
@@ -892,7 +1093,7 @@ class UsbCompositeProbeLink:
     is_uvc = True
     is_usb_composite = True
 
-    def __init__(self, video="auto", width=640, height=480, port=None):
+    def __init__(self, video="auto", width=320, height=240, port=None):
         self.camera = V4L2Source(video, width, height)
         self.want_port = port
         self.port = None
@@ -944,6 +1145,7 @@ class UsbCompositeProbeLink:
         self.camera.stop()
 
     def _manager(self):
+        backoff = 1.0
         while self.running:
             port = find_usb_imu_port(self.want_port)
             if port is None:
@@ -956,9 +1158,27 @@ class UsbCompositeProbeLink:
                 self.state = "connecting"
             try:
                 # Baud is ignored by USB CDC but a conventional value keeps
-                # pyserial portable. DTR opens the firmware telemetry gate.
-                self.ser = serial.Serial(port, 115200, timeout=0.5,
-                                         write_timeout=0.3)
+                # pyserial portable. DTR opens the firmware telemetry gate
+                # (usb_device_cdc.c calls tud_cdc_n_connected, which tests it),
+                # so it is raised deliberately and RTS is left down. Both are
+                # set before open so the port is never opened with one state
+                # and immediately changed to another: the UVC and CDC
+                # interfaces belong to one device, and needless line-state
+                # churn on a retry loop is churn on the video path too.
+                ser = serial.Serial()
+                ser.port = port
+                ser.baudrate = 115200
+                ser.timeout = 0.5
+                ser.write_timeout = 0.3
+                ser.dtr = True
+                ser.rts = False
+                try:
+                    ser.exclusive = True     # keep a second copy off the port
+                except (AttributeError, ValueError):
+                    pass
+                ser.open()
+                self.ser = ser
+                backoff = 1.0
                 self.port = port
                 self.parser = UsbImuPacketParser()
                 self.last_sequence = None
@@ -981,7 +1201,11 @@ class UsbCompositeProbeLink:
                                     self.generation += 1
                                 first_packet = False
                             self._publish(record)
-                    elif time.monotonic() - last_byte > 3.0:
+                    elif time.monotonic() - last_byte > 6.0:
+                        # Six seconds, not three. The firmware sends at 100 Hz,
+                        # so a real disconnection is obvious long before this;
+                        # the shorter limit mostly caught the gyro calibration
+                        # window and turned it into a reconnect.
                         raise TimeoutError("USB IMU telemetry timed out")
             except Exception as exc:
                 if self.running:
@@ -997,7 +1221,12 @@ class UsbCompositeProbeLink:
                         pass
                     self.ser = None
             if self.running:
-                time.sleep(1.0)
+                # Backing off matters because the CDC interface being reopened
+                # is on the same physical device as the video interface. A
+                # once-per-second reopen loop, running for as long as the IMU
+                # is unhappy, is constant disturbance underneath the picture.
+                time.sleep(backoff)
+                backoff = min(backoff * 2.0, 8.0)
 
     def _publish(self, record):
         sequence = record["sequence"]
@@ -1047,6 +1276,7 @@ class UsbCompositeProbeLink:
                 "fps": self.camera.fps(),
                 "camera_error": self.camera.error,
                 "camera_reconnects": self.camera.reconnects,
+                "capture_size": self.camera.actual,
                 "bad": self.bad_packets,
                 "dropped": self.dropped_packets,
                 "port": self.port,
@@ -2196,6 +2426,14 @@ class App:
         self.log = self._open_log(args.log) if args.log else None
         self._log_rows = 0
 
+        self._fs_fixes = 0
+        self._fs_target = (0, 0)
+        self.video_only = bool(getattr(args, "video_only", False))
+        self.skip_btn = None
+        self._setup_t0 = 0.0
+        self._exiting = False
+        self._layout_after = None
+
         self.root = tk.Tk()
         self.root.title("Endoscope")
         self.root.configure(bg=BG)
@@ -2205,17 +2443,32 @@ class App:
             self.W = self.root.winfo_width()
             self.H = self.root.winfo_height()
         else:
+            sw = self.root.winfo_screenwidth()
+            sh = self.root.winfo_screenheight()
+            # Ask the window manager for fullscreen; do not bypass it.
+            # overrideredirect(True) used to be set here as well, and that
+            # combination is why fullscreen showed no picture while --windowed
+            # worked. An override-redirect window is invisible to the window
+            # manager, so wm_attributes -fullscreen is never acknowledged:
+            # attributes("-fullscreen") kept reading back false, the watchdog
+            # below kept re-asserting it, and under the compositor on current
+            # Raspberry Pi OS every re-assert re-mapped the toplevel. The
+            # canvas spent its life being torn down and rebuilt, so the video
+            # image had no chance to stay on screen.
+            self.root.geometry("{}x{}+0+0".format(sw, sh))
             self.root.attributes("-fullscreen", True)
-            self.root.attributes("-topmost", True)
-            self.root.overrideredirect(True)
+            if args.kiosk:
+                # Opt-in for locked-down installs with no window manager.
+                self.root.overrideredirect(True)
+                self.root.attributes("-topmost", True)
             self.root.configure(cursor="none")
-            self.root.update_idletasks()
-            self.W = self.root.winfo_screenwidth()
-            self.H = self.root.winfo_screenheight()
-            # A window manager, a notification or a stray key can drop a
-            # window out of fullscreen. On a fixed-function instrument that
-            # must never happen, so the state is re-asserted rather than
-            # merely requested once.
+            self.root.update()          # map it before trusting any geometry
+            self.W = self.root.winfo_width()
+            self.H = self.root.winfo_height()
+            if self.W < 320 or self.H < 240:
+                # Some window managers report 1x1 until the first Configure.
+                self.W, self.H = sw, sh
+            self._fs_target = (self.W, self.H)
             self._keep_fullscreen()
 
         self.pick_font()
@@ -2239,8 +2492,45 @@ class App:
         self.root.bind("<Escape>", lambda e: self.quit())
         self.root.bind("<Key>", self.on_key)
         self.root.protocol("WM_DELETE_WINDOW", self.quit)
+        # Fullscreen is frequently granted a moment after the window is mapped,
+        # and on a second monitor or a rotated display the size can differ from
+        # anything queried up front. Everything here is laid out in absolute
+        # pixels, so a stale W/H puts the picture in a corner of a black
+        # screen -- which is indistinguishable from "fullscreen shows nothing".
+        self.root.bind("<Configure>", self._on_configure)
 
-        self.set_stage(self.STAGE_SETUP)
+        self.set_stage(self.STAGE_RUN if self.video_only
+                       else self.STAGE_SETUP)
+
+    def _on_configure(self, event):
+        if self._exiting or event.widget is not self.root:
+            return
+        if abs(event.width - self.W) < 8 and abs(event.height - self.H) < 8:
+            return
+        if event.width < 200 or event.height < 150:
+            return
+        if self._layout_after is not None:
+            try:
+                self.root.after_cancel(self._layout_after)
+            except Exception:
+                pass
+        # Debounced: a drag or a WM animation emits a burst of these.
+        self._layout_after = self.root.after(150, self._relayout)
+
+    def _relayout(self):
+        self._layout_after = None
+        if self._exiting:
+            return
+        w, h = self.root.winfo_width(), self.root.winfo_height()
+        if w < 200 or h < 150 or (w == self.W and h == self.H):
+            return
+        self.W, self.H = w, h
+        self._fs_target = (w, h)
+        self._fonts = {}
+        self.canvas.configure(width=w, height=h)
+        self.canvas.coords(self.video_item, w // 2, h // 2)
+        self.last_seq = -1              # force the next frame to be redrawn
+        self.set_stage(self.stage)
 
     # ---- config / logging
 
@@ -2403,6 +2693,7 @@ class App:
         self.drift_line = None
         self.setup_status = None
         self.zero_btn = None
+        self.skip_btn = None
         self.nosignal = None
         self.video_flip_h_btn = None
         self.video_flip_v_btn = None
@@ -2413,6 +2704,7 @@ class App:
 
         self.stage = stage
         if stage == self.STAGE_SETUP:
+            self._setup_t0 = time.monotonic()
             self.enter_setup()
         elif stage == self.STAGE_CHECK:
             self.enter_check()
@@ -2505,6 +2797,18 @@ class App:
         r, t, _, _ = self.button(W / 2, H * 0.855, "ZERO", MUTED,
                                  self.do_zero, max(15, int(H / 22)), store=z)
         self.zero_btn = (r, t)          # recoloured live once the probe is up
+        # Zeroing needs the IMU, but inspecting a bore does not. If the IMU has
+        # not appeared after a while the operator would otherwise be stuck on
+        # this screen with a working camera behind it, which is the opposite of
+        # useful. The button stays hidden until waiting has clearly failed, so
+        # the normal path is still ZERO first.
+        sr, st, _, _ = self.button(W - max(10, H // 46), H * 0.855,
+                                   "VIDEO ONLY \u2192", "#455a64",
+                                   self.start_video_only,
+                                   max(11, int(H / 34)), store=z, anchor="e")
+        self.skip_btn = (sr, st)
+        for item in self.skip_btn:
+            c.itemconfigure(item, state="hidden")
         z.append(c.create_text(
             W / 2, H * 0.955,
             text="lens axis: " + AXES[self.axis_idx][0],
@@ -2516,6 +2820,13 @@ class App:
         z.append(c.create_text(W - max(10, H // 46), H - max(10, H // 46),
                                anchor="se", text="USB-C host app v" + APP_VER,
                                fill=MUTED, font=self.f(small)))
+
+    def start_video_only(self):
+        """Live picture with no aim reference, clearly labelled as such."""
+        self.video_only = True
+        self.q_ref = None
+        self.notice = ""
+        self.set_stage(self.STAGE_RUN)
 
     def do_zero(self):
         if not self.capture_zero():
@@ -2838,13 +3149,26 @@ class App:
             self.toast("ZEROED \u2713", OK)
 
     def _keep_fullscreen(self):
+        """Re-assert fullscreen only when the window really lost it.
+
+        The old version re-applied -fullscreen and -topmost unconditionally
+        every two seconds. Under a compositor each of those is a window
+        restack, and with overrideredirect set the check never read back true,
+        so it fired forever. Judging by the mapped size instead of by the
+        attribute is both correct and cheap, and a limited number of attempts
+        means a window manager that simply refuses fullscreen ends up with a
+        usable maximised window rather than a permanent fight.
+        """
+        if self._fs_fixes > 6:
+            return
         try:
-            if not self.root.attributes("-fullscreen"):
+            if (self.root.winfo_width() < self._fs_target[0] - 8
+                    or self.root.winfo_height() < self._fs_target[1] - 8):
+                self._fs_fixes += 1
                 self.root.attributes("-fullscreen", True)
-            self.root.attributes("-topmost", True)
         except Exception:
             return
-        self.root.after(2000, self._keep_fullscreen)
+        self.root.after(3000, self._keep_fullscreen)
 
     # ---- keyboard shortcuts (development convenience; the device is touch)
 
@@ -3024,6 +3348,13 @@ class App:
                          and h.get("calib_ok") is not False)
                 self.canvas.itemconfigure(self.zero_btn[0],
                                           fill="#2e7d32" if ready else MUTED)
+                if self.skip_btn:
+                    waited = time.monotonic() - self._setup_t0
+                    show = (not ready and waited > 12.0
+                            and not h.get("camera_failed", True))
+                    for item in self.skip_btn:
+                        self.canvas.itemconfigure(
+                            item, state="normal" if show else "hidden")
 
         elif self.stage == self.STAGE_CHECK:
             if self.axis_auto and self.axis_det is not None:
@@ -3189,6 +3520,11 @@ class App:
             sp = h.get("sensor_preset")
             if sp is not None:
                 bits.append("SP{}".format(sp[0]))
+            if self.q_ref is None:
+                bits.append("NO ZERO \u2014 HEADING NOT VALID")
+            size = h.get("capture_size")
+            if size:
+                bits.append("{}x{}".format(*size))
             if h["state"] != "online":
                 bits.append(h["state"].upper())
             if still:
@@ -4103,6 +4439,9 @@ class App:
         self.toast("CALIBRATION SAVED \u2713", OK, ms=1800)
 
     def quit(self):
+        if self._exiting:
+            return
+        self._exiting = True
         if self.log:
             try:
                 self.log[0].flush()
@@ -4110,6 +4449,15 @@ class App:
             except Exception:
                 pass
             self.log = None
+        # Backstop. If anything in the shutdown path blocks -- most often the
+        # reader thread sitting inside a V4L2 select -- the process still ends
+        # on time, and the camera is free for the next launch. Without this the
+        # window closed instantly but the process lived on holding
+        # /dev/video0, so relaunching within a few seconds showed no picture.
+        watchdog = threading.Thread(
+            target=lambda: (time.sleep(4.0), os._exit(0)), daemon=True,
+            name="exit-watchdog")
+        watchdog.start()
         try:
             self.root.destroy()
         except Exception:
@@ -4130,8 +4478,11 @@ def main():
                          "serial stream, e.g. --video auto or --video /dev/video0. The "
                          "probe then supplies attitude only, and none of the "
                          "firmware colour handling is in the picture path.")
-    ap.add_argument("--video-size", default="640x480",
-                    help="requested UVC capture size (default 640x480)")
+    ap.add_argument("--video-size", default=DEFAULT_CAPTURE,
+                    help="requested UVC capture size (default {}, the size the "
+                         "v6 firmware lists first; larger sizes negotiate but "
+                         "starve on a full-speed link and the app steps back "
+                         "down on its own)".format(DEFAULT_CAPTURE))
     ap.add_argument("--official", action="store_true",
                     help="use M5Stack stock firmware: UVC video plus raw IMU from "
                          "ws://192.168.4.1; no custom colour path")
@@ -4143,6 +4494,14 @@ def main():
     ap.add_argument("--legacy-colour-tools", action="store_true",
                     help="show the old COLOR/DIAG/TUNE controls (diagnostics only)")
     ap.add_argument("--windowed", action="store_true")
+    ap.add_argument("--kiosk", action="store_true",
+                    help="bypass the window manager (override-redirect). Only "
+                         "for installs with no desktop; on a normal Raspberry "
+                         "Pi desktop this stops fullscreen working.")
+    ap.add_argument("--video-only", action="store_true",
+                    help="go straight to live video without zeroing. The aim "
+                         "indicator is hidden because there is no reference; "
+                         "use it to check the camera or to work without the IMU.")
     ap.add_argument("--sim", action="store_true",
                     help="synthetic probe: run the whole UI with no hardware")
     ap.add_argument("--log", metavar="FILE.csv",
@@ -4158,6 +4517,15 @@ def main():
             raise ValueError
     except ValueError:
         ap.error("--video-size must look like 640x480")
+
+    lock = None
+    if not args.sim:
+        # Ends any previous instance and waits for it to let go of the camera,
+        # so "close it and open it again" is reliable rather than a race.
+        lock = claim_single_instance()
+        if not wait_for_free_camera():
+            print("endoscope: /dev/video* still busy; opening anyway",
+                  file=sys.stderr)
 
     if args.sim:
         link = SimLink().start()
@@ -4186,6 +4554,18 @@ def main():
                 print(" ", s)
         if link.bad_packets:
             print(f"({link.bad_packets} corrupted packets discarded)")
+        sys.stdout.flush()
+        sys.stderr.flush()
+        if lock is not None:
+            try:
+                lock.close()
+            except Exception:
+                pass
+        # Exit without unwinding. A reader thread can still be parked inside
+        # OpenCV's V4L2 select for several seconds, and until this process is
+        # gone it owns /dev/video0. Process exit closes every descriptor at
+        # once, which is what makes an immediate relaunch work.
+        os._exit(0)
     return 0
 
 
