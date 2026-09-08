@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# Flash the tested one-file v6.0.1 image from Linux/macOS or a Raspberry Pi.
+# Flash the tested one-file v6.0.3 image from Linux/macOS or a Raspberry Pi.
 # The Windows CMD route in FLASHING_CN.md is the primary, tested path; this is
 # the same commands for a Pi that already has esptool.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-IMAGE="${SCRIPT_DIR}/release/atoms3r_cam_uvc_imu_v6_0_1.bin"
+IMAGE="${SCRIPT_DIR}/release/atoms3r_cam_uvc_imu_v6_0_3.bin"
 PORT="${1:-}"
 
 if [[ -z "${PORT}" ]]; then

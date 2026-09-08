@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Endoscope viewer with a 3D aim indicator  (v6.0.1)
+Endoscope viewer with a 3D aim indicator  (v6.0.3)
 ----------------------------------------------
 Fullscreen video from the AtomS3R-CAM probe plus a compass showing where the
 lens is aimed, for work where the probe is out of sight.
@@ -84,6 +84,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import signal
 import socket
 import subprocess
@@ -122,7 +123,7 @@ from PIL import Image, ImageTk
 
 CONFIG = os.path.join(os.path.expanduser("~"), ".config", "endoscope.json")
 SYNC = b"\xa5\x5a"
-APP_VER = "6.0.2"
+APP_VER = "6.0.3"
 CONFIG_REV = 6
 
 # One running instance owns /dev/video* and /dev/ttyACM*. A second launch that
@@ -155,6 +156,10 @@ USB_IMU_FLAG_VALID = 1 << 0
 USB_IMU_FLAG_MAG_VALID = 1 << 1
 USB_IMU_FLAG_CALIBRATED = 1 << 2
 USB_IMU_FLAG_STATIONARY = 1 << 3
+# v6.0.3 firmware: the probe reports its own sensor trouble instead of
+# leaving the app to mislabel it "connecting" while packets are flowing.
+USB_IMU_FLAG_SENSOR_FAULT = 1 << 4      # BMI270 reads failing right now
+USB_IMU_FLAG_SENSOR_RECOVERED = 1 << 5  # bus+sensor re-init just succeeded
 
 TYPE_IMU = 1
 TYPE_FRAME = 2
@@ -690,6 +695,36 @@ def find_port(preferred=None):
     return None
 
 
+def _fw_version_from_port(port):
+    """Firmware version from the USB iSerialNumber, e.g. ATOMCAMV603 -> (6,0,3).
+
+    v6.0.3+ encodes its version in the serial string precisely so the app can
+    display which firmware is actually plugged in; the field failure where a
+    v5 host ran beside v6 firmware was only diagnosable from a screenshot.
+    Returns None for older firmware or when sysfs/by-id gives no answer.
+    """
+    texts = [os.path.basename(os.path.realpath(port)), os.path.basename(port)]
+    if port.startswith("/dev/serial/by-id/"):
+        texts.append(os.path.basename(port))
+    path = os.path.realpath("/sys/class/tty/{}/device".format(
+        os.path.basename(os.path.realpath(port))))
+    for _ in range(7):
+        try:
+            with open(os.path.join(path, "serial"), encoding="utf-8") as f:
+                texts.append(f.read().strip())
+        except OSError:
+            pass
+        parent = os.path.dirname(path)
+        if parent == path:
+            break
+        path = parent
+    for text in texts:
+        m = re.search(r"ATOMCAMV(\d)(\d)(\d)", text)
+        if m:
+            return tuple(int(g) for g in m.groups())
+    return None
+
+
 def find_usb_imu_port(preferred=None):
     """Find the CDC interface of the v6 UVC+IMU composite device.
 
@@ -1107,7 +1142,12 @@ class UsbCompositeProbeLink:
         self.dropped_packets = 0
         self.state = "searching"
         self.fw = "usb_uvc_cdc_v6"
+        # Refined from the USB serial string (ATOMCAMV603 -> (6, 0, 3)) when
+        # the port is opened; v6.0.1 firmware predates that convention.
         self.fw_ver = (6, 0, 1)
+        self.imu_reconnects = 0         # serial reopen count, like UVC retry
+        self.last_imu_error = None      # last reopen reason, for the operator
+        self._recovered_prev = False    # edge detector for the RECOVERED bit
         self.calib_ok = None
         self.calibrating = True
         self.camera_failed = False
@@ -1156,6 +1196,10 @@ class UsbCompositeProbeLink:
 
             with self.lock:
                 self.state = "connecting"
+            fw_ver = _fw_version_from_port(port)
+            if fw_ver is not None:
+                with self.lock:
+                    self.fw_ver = fw_ver
             try:
                 # Baud is ignored by USB CDC but a conventional value keeps
                 # pyserial portable. DTR opens the firmware telemetry gate
@@ -1213,6 +1257,8 @@ class UsbCompositeProbeLink:
                     del self.status[:-50]
                 with self.lock:
                     self.state = "offline"
+                    self.imu_reconnects += 1
+                    self.last_imu_error = str(exc)
             finally:
                 if self.ser is not None:
                     try:
@@ -1221,12 +1267,19 @@ class UsbCompositeProbeLink:
                         pass
                     self.ser = None
             if self.running:
-                # Backing off matters because the CDC interface being reopened
-                # is on the same physical device as the video interface. A
-                # once-per-second reopen loop, running for as long as the IMU
-                # is unhappy, is constant disturbance underneath the picture.
-                time.sleep(backoff)
-                backoff = min(backoff * 2.0, 8.0)
+                # v6.0.2 backed off 1->8 s here, which turned every hiccup
+                # into many seconds of grey needle. Reopening /dev/ttyACM* is
+                # a host-side file operation: it does not touch the video
+                # interface or USB scheduling, so when the device is still
+                # present a quick retry is free. The long back-off is kept
+                # only for the port-vanished case, where retrying cannot help
+                # until the cable is back anyway.
+                if find_usb_imu_port(self.want_port) is not None:
+                    time.sleep(0.5)
+                    backoff = 1.0
+                else:
+                    time.sleep(backoff)
+                    backoff = min(backoff * 2.0, 4.0)
 
     def _publish(self, record):
         sequence = record["sequence"]
@@ -1237,6 +1290,7 @@ class UsbCompositeProbeLink:
         self.last_sequence = sequence
         flags = record["flags"]
         now = time.monotonic()
+        recovered = bool(flags & USB_IMU_FLAG_SENSOR_RECOVERED)
         with self.lock:
             self.last_imu = record
             self.quat = record["quaternion"]
@@ -1244,7 +1298,20 @@ class UsbCompositeProbeLink:
             self.calibrating = not bool(flags & USB_IMU_FLAG_CALIBRATED)
             self.calib_ok = True if not self.calibrating else None
             self.imu_time = now
-            self.state = "online" if flags & USB_IMU_FLAG_VALID else "connecting"
+            if flags & USB_IMU_FLAG_VALID:
+                self.state = "online"
+            elif flags & USB_IMU_FLAG_SENSOR_FAULT:
+                # The link is fine; the probe is telling us its motion sensor
+                # is failing and that it is re-initialising it by itself.
+                self.state = "imu_fault"
+            else:
+                self.state = "connecting"
+            # A recovery re-seeds the firmware fusion (yaw restarts at zero),
+            # so any zero captured before it now points somewhere else. Bump
+            # the generation and the existing restart logic forces a re-zero.
+            if recovered and not self._recovered_prev:
+                self.generation += 1
+            self._recovered_prev = recovered
 
     def snapshot(self):
         frame, sequence, _ = self.camera.snapshot()
@@ -1279,6 +1346,8 @@ class UsbCompositeProbeLink:
                 "capture_size": self.camera.actual,
                 "bad": self.bad_packets,
                 "dropped": self.dropped_packets,
+                "imu_reconnects": self.imu_reconnects,
+                "last_imu_error": self.last_imu_error,
                 "port": self.port,
             }
 
@@ -3236,10 +3305,15 @@ class App:
 
     def probe_status_text(self, h):
         if getattr(self.link, "is_usb_composite", False):
+            if h["state"] == "imu_fault":
+                return ("PROBE: motion sensor fault — probe is repairing its "
+                        "IMU by itself, keep it plugged in", ALERT)
             if h["state"] in ("searching", "connecting"):
                 return ("PROBE: waiting for USB IMU — check /dev/ttyACM*", DIM)
             if h["state"] == "offline":
-                return ("PROBE: USB IMU offline — reconnect the Type-C cable", ALERT)
+                why = h.get("last_imu_error") or ""
+                why = " ({})".format(why[:48]) if why else ""
+                return ("PROBE: USB IMU offline — retrying" + why, ALERT)
             if h["camera_failed"]:
                 retries = h.get("camera_reconnects", 0)
                 return ("PROBE: USB IMU online; UVC reconnecting"
@@ -3525,8 +3599,12 @@ class App:
             size = h.get("capture_size")
             if size:
                 bits.append("{}x{}".format(*size))
-            if h["state"] != "online":
+            if h["state"] == "imu_fault":
+                bits.append("IMU FAULT — SELF-REPAIRING")
+            elif h["state"] != "online":
                 bits.append(h["state"].upper())
+            if h.get("imu_reconnects"):
+                bits.append("IMU retry {}".format(h["imu_reconnects"]))
             if still:
                 bits.append("bias trim")
             if h["bad"]:

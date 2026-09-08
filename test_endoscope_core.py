@@ -2,10 +2,13 @@
 """Hardware-free regression tests for v6 transport, fusion and video flips."""
 
 import importlib.util
+import inspect
 import json
 import math
 import socket
 import sys
+import threading
+import time
 import types
 import zlib
 from pathlib import Path
@@ -156,12 +159,122 @@ def test_firmware_composite_contract():
     descriptor = (HERE / "firmware/components/usb_device_uvc/tusb/usb_descriptors.c").read_text()
     config = (HERE / "firmware/components/usb_device_uvc/tusb/tusb_config.h").read_text()
     service = (HERE / "firmware/main/service/service_usb_imu.cpp").read_text()
+    uvc_service = (HERE / "firmware/main/service/service_uvc.cpp").read_text()
+    cdc = (HERE / "firmware/components/usb_device_uvc/usb_device_cdc.c").read_text()
     main = (HERE / "firmware/main/usb_webcam_main.cpp").read_text()
     assert "TUD_CDC_DESCRIPTOR" in descriptor
     assert "#define CFG_TUD_CDC" in config and " 1" in config
     assert "static_assert(sizeof(ImuPacketV1) == 76" in service
     assert "start_service_usb_imu();" in main
     assert "start_service_web_server();" not in main
+    # Regression for v6.0's permanent UVC stall: every callback return must
+    # release SharedData, including capture/JPEG/oversize failures.
+    assert "class SharedDataGuard" in uvc_service
+    assert "#define UVC_MAX_FRAMESIZE_SIZE (128 * 1024)" in uvc_service
+    # v6.0.3 IMU-drop fixes. All TinyUSB CDC transmit calls must stay inside
+    # the TinyUSB task (usbd_defer_func); the IMU task only fills a mailbox.
+    assert "usb_device_cdc_submit(&packet, sizeof(packet));" in service
+    assert "usb_device_cdc_write" not in service
+    assert "usbd_defer_func(cdc_tx_pump" in cdc
+    assert "usbd_edpt_clear_stall" in cdc          # last-resort endpoint re-arm
+    assert "tud_cdc_tx_complete_cb" in cdc         # progress ground truth
+    # The probe must repair its own sensor and say so on the wire.
+    assert "kFlagSensorFault = 1u << 4" in service
+    assert "kFlagSensorRecovered = 1u << 5" in service
+    assert "recover_imu_sensor()" in service
+    assert "#define CFG_TUD_CDC_TX_BUFSIZE   512" in config
+
+
+def test_usb_fault_states(app):
+    """Sensor trouble must be named, not shown as an eternal "connecting"."""
+    link = app.UsbCompositeProbeLink()
+    valid = (app.USB_IMU_FLAG_VALID | app.USB_IMU_FLAG_CALIBRATED)
+
+    link._publish({"flags": valid, "sequence": 1, "quaternion": (1, 0, 0, 0)})
+    assert link.state == "online"
+
+    fault = app.USB_IMU_FLAG_SENSOR_FAULT | app.USB_IMU_FLAG_CALIBRATED
+    link._publish({"flags": fault, "sequence": 2, "quaternion": (1, 0, 0, 0)})
+    assert link.state == "imu_fault"
+
+    # Old firmware never sets the fault bit; that stays "connecting".
+    link._publish({"flags": app.USB_IMU_FLAG_CALIBRATED, "sequence": 3,
+                   "quaternion": (1, 0, 0, 0)})
+    assert link.state == "connecting"
+
+    # A recovery re-seeds the firmware fusion, so the app must invalidate any
+    # earlier zero: one generation bump per recovery edge, not per packet.
+    gen = link.generation
+    recovered = valid | app.USB_IMU_FLAG_SENSOR_RECOVERED
+    link._publish({"flags": recovered, "sequence": 4, "quaternion": (1, 0, 0, 0)})
+    link._publish({"flags": recovered, "sequence": 5, "quaternion": (1, 0, 0, 0)})
+    assert link.generation == gen + 1
+    link._publish({"flags": valid, "sequence": 6, "quaternion": (1, 0, 0, 0)})
+    link._publish({"flags": recovered, "sequence": 7, "quaternion": (1, 0, 0, 0)})
+    assert link.generation == gen + 2
+    assert link.state == "online"
+
+
+def test_fw_version_from_serial_string(app):
+    """v6.0.3+ encodes its version in iSerialNumber for on-screen display."""
+    by_id = ("/dev/serial/by-id/usb-Espressif_AtomS3R-CAM_UVC+IMU_v6.0.3_"
+             "ATOMCAMV603-if04-port0")
+    assert app._fw_version_from_port(by_id) == (6, 0, 3)
+    assert app._fw_version_from_port("/dev/ttyACM99") is None
+
+
+def test_v4l2_handle_stays_on_reader_thread(app):
+    """The UI thread must never free a VideoCapture blocked in V4L2 select."""
+    stop_source = inspect.getsource(app.V4L2Source.stop)
+    loop_source = inspect.getsource(app.V4L2Source._loop)
+    assert ".release(" not in stop_source
+    assert ".release(" in loop_source
+    assert "self.reconnects += 1" in loop_source
+
+    captures = []
+
+    class FakeCapture:
+        """First handle fails once; replacement provides small live frames."""
+
+        def __init__(self, _source, _backend):
+            self.owner = threading.get_ident()
+            self.release_thread = None
+            self.first = len(captures) == 0
+            captures.append(self)
+
+        def isOpened(self):
+            return True
+
+        def set(self, *_args):
+            return True
+
+        def read(self):
+            time.sleep(0.01)
+            if self.first:
+                self.first = False
+                return False, None
+            return True, np.zeros((2, 2, 3), dtype=np.uint8)
+
+        def release(self):
+            self.release_thread = threading.get_ident()
+
+    app.cv2.VideoCapture = FakeCapture
+    app.cv2.VideoWriter_fourcc = lambda *_args: 0
+    app.cv2.CAP_PROP_FOURCC = 1
+    app.cv2.CAP_PROP_FRAME_WIDTH = 2
+    app.cv2.CAP_PROP_FRAME_HEIGHT = 3
+    app.cv2.CAP_PROP_BUFFERSIZE = 4
+
+    main_thread = threading.get_ident()
+    source = app.V4L2Source(index=0).start()
+    deadline = time.monotonic() + 2.0
+    while (len(captures) < 2 or source.frame_seq == 0) and time.monotonic() < deadline:
+        time.sleep(0.02)
+    source.stop()
+
+    assert len(captures) >= 2 and source.reconnects >= 1
+    assert captures[0].release_thread == captures[0].owner != main_thread
+    assert captures[1].release_thread == captures[1].owner != main_thread
 
 
 def main():
@@ -172,7 +285,11 @@ def main():
     test_websocket_frame(app)
     test_video_flips_are_independent(app)
     test_firmware_composite_contract()
-    print("PASS: USB packet recovery, fallback fusion, WebSocket, flips, firmware contract")
+    test_usb_fault_states(app)
+    test_fw_version_from_serial_string(app)
+    test_v4l2_handle_stays_on_reader_thread(app)
+    print("PASS: USB packets, fault states, fw-version, fusion, WebSocket, "
+          "flips, UVC recovery, firmware contract")
 
 
 if __name__ == "__main__":

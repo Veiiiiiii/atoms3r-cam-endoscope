@@ -14,4 +14,16 @@ sudo apt-get install -y \
 # Group changes take effect at the next login; a reboot is the clearest step.
 sudo usermod -aG video,dialout "${USER}"
 
+# ModemManager (present on desktop Pi images) probes every new ttyACM device:
+# for tens of seconds after plug-in it opens the port, writes AT commands and
+# competes for the bytes. Split reads look like CRC errors and "IMU drops" in
+# the app. This rule tells it the probe is not a modem. Harmless to re-run and
+# harmless on systems without ModemManager.
+sudo tee /etc/udev/rules.d/99-atoms3r-endoscope.rules >/dev/null <<'RULE'
+# M5Stack AtomS3R-CAM UVC+IMU composite (Espressif VID): not a modem.
+SUBSYSTEM=="tty", ATTRS{idVendor}=="303a", ATTRS{idProduct}=="8000", ENV{ID_MM_DEVICE_IGNORE}="1"
+SUBSYSTEM=="usb", ATTR{idVendor}=="303a", ATTR{idProduct}=="8000", ENV{ID_MM_DEVICE_IGNORE}="1"
+RULE
+sudo udevadm control --reload-rules 2>/dev/null || true
+
 echo "Install complete. Reboot once, then run: ./run_usb.sh"

@@ -1,5 +1,5 @@
 @echo off
-REM Flash the tested one-file v6.0.1 image from Windows Command Prompt.
+REM Flash the tested one-file v6.0.3 image from Windows Command Prompt.
 REM This is the only supported way to flash. See FLASHING_CN.md for why an
 REM Arduino IDE build produces a garbled picture on this board.
 setlocal
@@ -13,7 +13,7 @@ if "%~1"=="" (
   exit /b 2
 )
 
-set "IMAGE=%~dp0release\atoms3r_cam_uvc_imu_v6_0_1.bin"
+set "IMAGE=%~dp0release\atoms3r_cam_uvc_imu_v6_0_3.bin"
 if not exist "%IMAGE%" (
   echo Firmware image not found: %IMAGE%
   exit /b 2

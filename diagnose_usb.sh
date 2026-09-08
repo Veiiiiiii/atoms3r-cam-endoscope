@@ -39,6 +39,16 @@ done
 echo
 echo "User groups (must include video and dialout):"
 id
+echo
+
+echo "Other processes holding the probe's ports (should be empty while the app is closed):"
+sudo fuser -v /dev/ttyACM* /dev/video* 2>&1 | grep -v "^$" || echo "  none"
+echo
+echo "ModemManager (should be ignoring the probe; install_pi.sh adds the udev rule):"
+systemctl is-active ModemManager 2>/dev/null || echo "  not installed (good)"
+ls -l /etc/udev/rules.d/99-atoms3r-endoscope.rules 2>/dev/null \
+    || echo "  udev rule missing — run ./install_pi.sh once"
 
 echo
-echo "Expected for v6.0.1: APP_VER 6.0.1, one MJPG video node, and /dev/ttyACM*."
+echo "Expected for v6.0.3: APP_VER 6.0.3, one MJPG video node, /dev/ttyACM*,"
+echo "and the by-id link containing ATOMCAMV603 after flashing the new firmware."
