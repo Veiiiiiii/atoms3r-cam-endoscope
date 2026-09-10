@@ -1,7 +1,6 @@
 @echo off
-REM Flash the tested one-file v6.0.3 image from Windows Command Prompt.
-REM This is the only supported way to flash. See FLASHING_CN.md for why an
-REM Arduino IDE build produces a garbled picture on this board.
+REM Flash the merged ESP-IDF image. No Arduino IDE build is needed.
+REM Hardware validation status is in TEST_REPORT.md.
 setlocal
 
 if "%~1"=="" (
@@ -13,7 +12,7 @@ if "%~1"=="" (
   exit /b 2
 )
 
-set "IMAGE=%~dp0release\atoms3r_cam_uvc_imu_v6_0_3.bin"
+set "IMAGE=%~dp0release\atoms3r_cam_uvc_imu_v6_0_4.bin"
 if not exist "%IMAGE%" (
   echo Firmware image not found: %IMAGE%
   exit /b 2
@@ -33,9 +32,9 @@ if errorlevel 1 goto :nolink
 
 REM The merged image already carries these in its header, but esptool has
 REM changed its own defaults between major versions. Writing them explicitly
-REM means a pip upgrade can never silently produce a garbled unit.
+REM keeps the write settings aligned with this release build.
 REM Values match firmware/merge_firmware.sh and firmware/sdkconfig:
-REM   dio  - forced by the octal PSRAM sharing the flash pins
+REM   dio  - release bootloader flash mode
 REM   80m  - CONFIG_ESPTOOLPY_FLASHFREQ
 REM   8MB  - ESP32-S3-PICO-1-N8R8
 set "FLAGS=--flash_mode dio --flash_freq 80m --flash_size 8MB"

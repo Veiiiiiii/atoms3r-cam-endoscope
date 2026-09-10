@@ -4,7 +4,8 @@
 set -uo pipefail
 
 REPO_URL="${ENDOSCOPE_REPO:-https://github.com/Veiiiiiii/atoms3r-cam-endoscope.git}"
-DEST="${ENDOSCOPE_DIR:-${HOME}/atoms3r-cam-endoscope}"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+DEST="${ENDOSCOPE_DIR:-${SCRIPT_DIR}}"
 
 pause() {
     echo
@@ -30,17 +31,14 @@ if [[ ! -d "${DEST}/.git" ]]; then
 else
     cd "${DEST}"
     # Keep whatever was edited on the Pi rather than destroying it silently.
-    if ! git diff --quiet || ! git diff --cached --quiet; then
+    if [[ -n "$(git status --porcelain)" ]]; then
         STAMP="local-$(date +%Y%m%d-%H%M%S)"
         echo "local edits found; saving them as stash '${STAMP}'"
-        git stash push -u -m "${STAMP}" >/dev/null || true
+        git stash push -u -m "${STAMP}" >/dev/null || { echo "STASH FAILED"; pause; exit 1; }
         echo "recover them later with: git stash list / git stash pop"
     fi
-    echo "fetching..."
-    git fetch --prune origin || { echo "FETCH FAILED (network?)"; pause; exit 1; }
-    BRANCH="$(git symbolic-ref --quiet --short HEAD 2>/dev/null || echo main)"
-    git reset --hard "origin/${BRANCH}" || {
-        echo "could not reset to origin/${BRANCH}"; pause; exit 1; }
+    # Refuse divergent history rather than destroying local commits.
+    git pull --ff-only || { echo "PULL FAILED; local history preserved"; pause; exit 1; }
 fi
 
 cd "${DEST}"

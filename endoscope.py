@@ -123,7 +123,7 @@ from PIL import Image, ImageTk
 
 CONFIG = os.path.join(os.path.expanduser("~"), ".config", "endoscope.json")
 SYNC = b"\xa5\x5a"
-APP_VER = "6.0.3"
+APP_VER = "6.0.4"
 CONFIG_REV = 6
 
 # One running instance owns /dev/video* and /dev/ttyACM*. A second launch that
@@ -1139,6 +1139,7 @@ class UsbCompositeProbeLink:
         self.still = False
         self.last_imu = None
         self.last_sequence = None
+        self.last_device_time = None  # Detect reboot even without tty removal.
         self.dropped_packets = 0
         self.state = "searching"
         self.fw = "usb_uvc_cdc_v6"
@@ -1227,30 +1228,39 @@ class UsbCompositeProbeLink:
                 self.parser = UsbImuPacketParser()
                 self.last_sequence = None
                 first_packet = True
-                last_byte = time.monotonic()
+                last_valid = time.monotonic()
+                last_heartbeat = last_valid
+                dtr_recovered = False
 
                 while self.running:
                     chunk = self.ser.read(self.ser.in_waiting or 1)
                     if chunk:
-                        last_byte = time.monotonic()
                         bad_before = self.parser.bad_packets
                         records = self.parser.feed(chunk)
                         self.bad_packets += self.parser.bad_packets - bad_before
                         # Publishing only the newest decoded record explicitly
                         # discards stale attitudes if scheduling was delayed.
                         if records:
+                            last_valid = time.monotonic()
+                            dtr_recovered = False
                             record = records[-1]
                             if first_packet:
                                 with self.lock:
                                     self.generation += 1
                                 first_packet = False
                             self._publish(record)
-                    elif time.monotonic() - last_byte > 6.0:
-                        # Six seconds, not three. The firmware sends at 100 Hz,
-                        # so a real disconnection is obvious long before this;
-                        # the shorter limit mostly caught the gyro calibration
-                        # window and turned it into a reconnect.
-                        raise TimeoutError("USB IMU telemetry timed out")
+                    # Judge health from valid packets, not arbitrary bytes. The
+                    # ignored heartbeat also wakes the firmware's USB-owner pump.
+                    now = time.monotonic()
+                    if now - last_heartbeat >= 1.0:
+                        self.ser.write(b"\x00")
+                        last_heartbeat = now
+                    if now - last_valid > 2.0 and not dtr_recovered:
+                        self.ser.dtr = False
+                        self.ser.dtr = True
+                        dtr_recovered = True
+                    if now - last_valid > 8.0:
+                        raise TimeoutError("USB IMU: no valid packet for 8 seconds")
             except Exception as exc:
                 if self.running:
                     self.status.append({"status": "imu_retry", "error": str(exc)})
@@ -1292,6 +1302,11 @@ class UsbCompositeProbeLink:
         now = time.monotonic()
         recovered = bool(flags & USB_IMU_FLAG_SENSOR_RECOVERED)
         with self.lock:
+            device_time = record["timestamp_us"]
+            if (self.last_device_time is not None
+                    and device_time < self.last_device_time):
+                self.generation += 1
+            self.last_device_time = device_time
             self.last_imu = record
             self.quat = record["quaternion"]
             self.still = bool(flags & USB_IMU_FLAG_STATIONARY)
@@ -2537,8 +2552,9 @@ class App:
             if self.W < 320 or self.H < 240:
                 # Some window managers report 1x1 until the first Configure.
                 self.W, self.H = sw, sh
-            self._fs_target = (self.W, self.H)
-            self._keep_fullscreen()
+            # Never let a decorated client redefine the physical target.
+            self._fs_target = (sw, sh)
+            self.root.after(900, self._verify_fullscreen)
 
         self.pick_font()
         self._fonts = {}
@@ -2594,7 +2610,6 @@ class App:
         if w < 200 or h < 150 or (w == self.W and h == self.H):
             return
         self.W, self.H = w, h
-        self._fs_target = (w, h)
         self._fonts = {}
         self.canvas.configure(width=w, height=h)
         self.canvas.coords(self.video_item, w // 2, h // 2)
@@ -2793,12 +2808,29 @@ class App:
                 and h.get("calib_ok") is not False)
 
     def capture_zero(self):
-        if not self.link_ready():
-            self.toast("PROBE NOT READY", WARN)
-            return False
-        _, _, q, _ = self.link.snapshot()
+        if getattr(self.link, "is_usb_composite", False):
+            # Sample reference and epoch atomically; a concurrent reconnect
+            # must not label an old quaternion with a new device generation.
+            with self.link.lock:
+                ready = (self.link.state == "online"
+                         and not self.link.calibrating
+                         and time.monotonic() - self.link.imu_time < 1.0)
+                still = self.link.still
+                q, generation = self.link.quat, self.link.generation
+            if not ready:
+                self.toast("PROBE NOT READY", WARN)
+                return False
+            if not still:
+                self.toast("HOLD STILL FOR 2 SECONDS", WARN)
+                return False
+        else:
+            if not self.link_ready():
+                self.toast("PROBE NOT READY", WARN)
+                return False
+            _, _, q, _ = self.link.snapshot()
+            generation = self.link.health()["generation"]
         self.q_ref = q
-        self.zero_gen = self.link.health()["generation"]
+        self.zero_gen = generation
         self.zero_time = time.monotonic()
         self.peak_az = 0.0
         self.axis_det = AxisDetector(q)
@@ -3217,27 +3249,29 @@ class App:
             self.axis_auto = False      # never switch the axis mid-inspection
             self.toast("ZEROED \u2713", OK)
 
-    def _keep_fullscreen(self):
-        """Re-assert fullscreen only when the window really lost it.
+    def _verify_fullscreen(self):
+        """One borderless fallback if the WM refused physical fullscreen.
 
-        The old version re-applied -fullscreen and -topmost unconditionally
-        every two seconds. Under a compositor each of those is a window
-        restack, and with overrideredirect set the check never read back true,
-        so it fired forever. Judging by the mapped size instead of by the
-        attribute is both correct and cheap, and a limited number of attempts
-        means a window manager that simply refuses fullscreen ends up with a
-        usable maximised window rather than a permanent fight.
+        Do not continually restack the window: that disrupted live video on
+        Pi compositors. Windowed debugging never uses this path.
         """
-        if self._fs_fixes > 6:
+        if self._exiting or self.args.windowed:
             return
         try:
-            if (self.root.winfo_width() < self._fs_target[0] - 8
-                    or self.root.winfo_height() < self._fs_target[1] - 8):
-                self._fs_fixes += 1
-                self.root.attributes("-fullscreen", True)
-        except Exception:
-            return
-        self.root.after(3000, self._keep_fullscreen)
+            sw, sh = self._fs_target
+            granted = (self.root.winfo_width() >= sw - 3
+                       and self.root.winfo_height() >= sh - 3
+                       and abs(self.root.winfo_rootx()) <= 3
+                       and abs(self.root.winfo_rooty()) <= 3)
+            if self.args.kiosk or not granted:
+                self.root.attributes("-fullscreen", False)
+                self.root.overrideredirect(True)
+                self.root.geometry(f"{sw}x{sh}+0+0")
+                self.root.attributes("-topmost", True)
+                self.root.lift()
+                self.root.focus_force()
+        except tk.TclError as exc:
+            print(f"Fullscreen fallback failed: {exc}", file=sys.stderr)
 
     # ---- keyboard shortcuts (development convenience; the device is touch)
 

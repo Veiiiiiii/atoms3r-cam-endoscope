@@ -1,0 +1,18 @@
+{
+    "OPENOCD_SCRIPTS": "/workspace/scratch/4413601f7d57/idf604-tools/tools/openocd-esp32/v0.12.0-esp32-20230921/openocd-esp32/share/openocd/scripts",
+    "ESP_ROM_ELF_DIR": "/workspace/scratch/4413601f7d57/idf604-tools/tools/esp-rom-elfs/20230320/",
+    "IDF_PYTHON_ENV_PATH": "/workspace/scratch/4413601f7d57/idf604-tools/python_env/idf5.1_py3.12_env",
+    "ESP_IDF_VERSION": "5.1",
+    "PATH": [
+        "/workspace/scratch/4413601f7d57/idf604-tools/tools/esp32ulp-elf/2.35_20220830/esp32ulp-elf/bin",
+        "/workspace/scratch/4413601f7d57/idf604-tools/tools/xtensa-esp32s3-elf/esp-12.2.0_20230208/xtensa-esp32s3-elf/bin",
+        "/workspace/scratch/4413601f7d57/idf604/components/partition_table",
+        "/workspace/scratch/4413601f7d57/idf604-tools/tools/xtensa-esp-elf-gdb/12.1_20231023/xtensa-esp-elf-gdb/bin",
+        "/workspace/scratch/4413601f7d57/idf604-tools/tools/openocd-esp32/v0.12.0-esp32-20230921/openocd-esp32/bin",
+        "/workspace/scratch/4413601f7d57/idf604/components/app_update",
+        "/workspace/scratch/4413601f7d57/idf604/components/espcoredump",
+        "/workspace/scratch/4413601f7d57/idf604-tools/python_env/idf5.1_py3.12_env/bin",
+        "/workspace/scratch/4413601f7d57/idf604/tools",
+        "/workspace/scratch/4413601f7d57/idf604-tools/tools/riscv32-esp-elf/esp-12.2.0_20230208/riscv32-esp-elf/bin"
+    ]
+}

@@ -5,7 +5,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 FIRMWARE_DIR="${SCRIPT_DIR}/firmware"
 RELEASE_DIR="${SCRIPT_DIR}/release"
-MERGED_BIN="${RELEASE_DIR}/atoms3r_cam_uvc_imu_v6_0_3.bin"
+MERGED_BIN="${RELEASE_DIR}/atoms3r_cam_uvc_imu_v6_0_4.bin"
 
 if ! command -v idf.py >/dev/null 2>&1; then
     echo "idf.py not found. Source ESP-IDF v5.1.4/export.sh first." >&2

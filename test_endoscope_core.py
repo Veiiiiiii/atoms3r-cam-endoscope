@@ -175,7 +175,8 @@ def test_firmware_composite_contract():
     # the TinyUSB task (usbd_defer_func); the IMU task only fills a mailbox.
     assert "usb_device_cdc_submit(&packet, sizeof(packet));" in service
     assert "usb_device_cdc_write" not in service
-    assert "usbd_defer_func(cdc_tx_pump" in cdc
+    assert "usbd_defer_func(" not in cdc
+    assert "usb_device_cdc_poll" in cdc
     assert "usbd_edpt_clear_stall" in cdc          # last-resort endpoint re-arm
     assert "tud_cdc_tx_complete_cb" in cdc         # progress ground truth
     # The probe must repair its own sensor and say so on the wire.
@@ -190,15 +191,15 @@ def test_usb_fault_states(app):
     link = app.UsbCompositeProbeLink()
     valid = (app.USB_IMU_FLAG_VALID | app.USB_IMU_FLAG_CALIBRATED)
 
-    link._publish({"flags": valid, "sequence": 1, "quaternion": (1, 0, 0, 0)})
+    link._publish({"flags": valid, "sequence": 1, "timestamp_us": 10000, "quaternion": (1, 0, 0, 0)})
     assert link.state == "online"
 
     fault = app.USB_IMU_FLAG_SENSOR_FAULT | app.USB_IMU_FLAG_CALIBRATED
-    link._publish({"flags": fault, "sequence": 2, "quaternion": (1, 0, 0, 0)})
+    link._publish({"flags": fault, "sequence": 2, "timestamp_us": 20000, "quaternion": (1, 0, 0, 0)})
     assert link.state == "imu_fault"
 
     # Old firmware never sets the fault bit; that stays "connecting".
-    link._publish({"flags": app.USB_IMU_FLAG_CALIBRATED, "sequence": 3,
+    link._publish({"flags": app.USB_IMU_FLAG_CALIBRATED, "sequence": 3, "timestamp_us": 30000,
                    "quaternion": (1, 0, 0, 0)})
     assert link.state == "connecting"
 
@@ -206,11 +207,11 @@ def test_usb_fault_states(app):
     # earlier zero: one generation bump per recovery edge, not per packet.
     gen = link.generation
     recovered = valid | app.USB_IMU_FLAG_SENSOR_RECOVERED
-    link._publish({"flags": recovered, "sequence": 4, "quaternion": (1, 0, 0, 0)})
-    link._publish({"flags": recovered, "sequence": 5, "quaternion": (1, 0, 0, 0)})
+    link._publish({"flags": recovered, "sequence": 4, "timestamp_us": 40000, "quaternion": (1, 0, 0, 0)})
+    link._publish({"flags": recovered, "sequence": 5, "timestamp_us": 50000, "quaternion": (1, 0, 0, 0)})
     assert link.generation == gen + 1
-    link._publish({"flags": valid, "sequence": 6, "quaternion": (1, 0, 0, 0)})
-    link._publish({"flags": recovered, "sequence": 7, "quaternion": (1, 0, 0, 0)})
+    link._publish({"flags": valid, "sequence": 6, "timestamp_us": 60000, "quaternion": (1, 0, 0, 0)})
+    link._publish({"flags": recovered, "sequence": 7, "timestamp_us": 70000, "quaternion": (1, 0, 0, 0)})
     assert link.generation == gen + 2
     assert link.state == "online"
 

@@ -50,13 +50,13 @@ for target_dir in "${DESKTOP}" "${APPS}"; do
     write_entry "${target_dir}/Endoscope.desktop" \
         "Endoscope" \
         "AtomS3R-CAM one-cable USB-C viewer (fullscreen)" \
-        "${SCRIPT_DIR}/run_usb.sh" \
+        '"'"${SCRIPT_DIR}/run_usb.sh"'"' \
         "camera-video" "false"
 
     write_entry "${target_dir}/Update Endoscope.desktop" \
         "Update Endoscope" \
         "Pull the newest Endoscope code from GitHub, then test it" \
-        "${SCRIPT_DIR}/update_endoscope.sh" \
+        '"'"${SCRIPT_DIR}/update_endoscope.sh"'"' \
         "system-software-update" "true"
 done
 

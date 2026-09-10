@@ -50,5 +50,14 @@ ls -l /etc/udev/rules.d/99-atoms3r-endoscope.rules 2>/dev/null \
     || echo "  udev rule missing — run ./install_pi.sh once"
 
 echo
-echo "Expected for v6.0.3: APP_VER 6.0.3, one MJPG video node, /dev/ttyACM*,"
-echo "and the by-id link containing ATOMCAMV603 after flashing the new firmware."
+echo "Expected for v6.0.4: APP_VER 6.0.4, one MJPG video node, /dev/ttyACM*,"
+echo "and the by-id link containing ATOMCAMV604 after flashing the new firmware."
+
+# The rule is device-specific. Replug/reboot after installation applies it.
+echo "USB power policy (expected: on):"
+for dev in /sys/bus/usb/devices/*; do
+    [[ -f "${dev}/idVendor" && -f "${dev}/idProduct" ]] || continue
+    if [[ "$(cat "${dev}/idVendor")" == 303a && "$(cat "${dev}/idProduct")" == 8000 ]]; then
+        echo "${dev}: $(cat "${dev}/power/control" 2>/dev/null || echo unavailable)"
+    fi
+done
