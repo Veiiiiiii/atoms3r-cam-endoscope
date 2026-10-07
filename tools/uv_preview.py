@@ -322,9 +322,68 @@ def take_screenshot(root, out_path):
     x1 = x0 + root.winfo_width()
     y1 = y0 + root.winfo_height()
     img = ImageGrab.grab(bbox=(x0, y0, x1, y1))
+    if sys.platform == "win32" and all(hi == 0 for _, hi in img.getextrema()):
+        # A locked workstation (or a disconnected RDP session) gives
+        # ImageGrab nothing but black. Ask the window to paint itself
+        # into a bitmap instead; that works without a visible desktop.
+        img = _print_window(root) or img
     out_path.parent.mkdir(parents=True, exist_ok=True)
     img.save(str(out_path))
     print("uv_preview: wrote", out_path)
+
+
+def _print_window(root):
+    """Win32 PrintWindow capture of the Tk client area, or None."""
+    try:
+        import ctypes
+        import ctypes.wintypes as wt
+        from PIL import Image
+
+        class _BMI(ctypes.Structure):
+            _fields_ = [("biSize", wt.DWORD), ("biWidth", wt.LONG),
+                        ("biHeight", wt.LONG), ("biPlanes", wt.WORD),
+                        ("biBitCount", wt.WORD), ("biCompression", wt.DWORD),
+                        ("biSizeImage", wt.DWORD), ("biXPelsPerMeter", wt.LONG),
+                        ("biYPelsPerMeter", wt.LONG), ("biClrUsed", wt.DWORD),
+                        ("biClrImportant", wt.DWORD)]
+
+        user32, gdi32 = ctypes.windll.user32, ctypes.windll.gdi32
+        # 64-bit handles: without these ctypes would truncate them to int.
+        vp = ctypes.c_void_p
+        user32.GetDC.restype = vp
+        user32.GetDC.argtypes = [vp]
+        user32.ReleaseDC.argtypes = [vp, vp]
+        user32.PrintWindow.argtypes = [vp, vp, ctypes.c_uint]
+        gdi32.CreateCompatibleDC.restype = vp
+        gdi32.CreateCompatibleDC.argtypes = [vp]
+        gdi32.CreateCompatibleBitmap.restype = vp
+        gdi32.CreateCompatibleBitmap.argtypes = [vp, ctypes.c_int, ctypes.c_int]
+        gdi32.SelectObject.restype = vp
+        gdi32.SelectObject.argtypes = [vp, vp]
+        gdi32.GetDIBits.argtypes = [vp, vp, ctypes.c_uint, ctypes.c_uint,
+                                    ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint]
+        gdi32.DeleteObject.argtypes = [vp]
+        gdi32.DeleteDC.argtypes = [vp]
+        hwnd = root.winfo_id()
+        w, h = root.winfo_width(), root.winfo_height()
+        hdc = user32.GetDC(hwnd)
+        mdc = gdi32.CreateCompatibleDC(hdc)
+        bmp = gdi32.CreateCompatibleBitmap(hdc, w, h)
+        gdi32.SelectObject(mdc, bmp)
+        ok = user32.PrintWindow(hwnd, mdc, 2)   # PW_RENDERFULLCONTENT
+        bmi = _BMI(ctypes.sizeof(_BMI), w, -h, 1, 32, 0, 0, 0, 0, 0, 0)
+        buf = ctypes.create_string_buffer(w * h * 4)
+        gdi32.GetDIBits(mdc, bmp, 0, h, buf, ctypes.byref(bmi), 0)
+        gdi32.DeleteObject(bmp)
+        gdi32.DeleteDC(mdc)
+        user32.ReleaseDC(hwnd, hdc)
+        if not ok:
+            return None
+        return Image.frombuffer("RGBA", (w, h), buf, "raw", "BGRA", 0, 1
+                                ).convert("RGB")
+    except Exception as exc:
+        print("uv_preview: PrintWindow capture failed:", exc, file=sys.stderr)
+        return None
 
 
 def run_shots_script(app, out_dir):
@@ -340,7 +399,11 @@ def run_shots_script(app, out_dir):
     root = app.root
 
     def shot(name):
-        take_screenshot(root, out_dir / name)
+        # Wait for a few App.update() ticks first: a toggle only takes
+        # effect on the next drawn frame, so capturing in the same tick
+        # would photograph the previous state's picture and an empty
+        # status line.
+        root.after(300, lambda: take_screenshot(root, out_dir / name))
 
     def maybe(name_attr, *call_args):
         fn = getattr(app, name_attr, None)
@@ -396,7 +459,7 @@ def run_shots_script(app, out_dir):
 
     chain = [seq_01, seq_02, seq_03_on, seq_03_off, seq_04_on, seq_04_off,
              seq_exit_uv, seq_quit]
-    STEP_MS = 500
+    STEP_MS = 1000     # leaves room for the 300 ms post-action shot delay
 
     def run_next(i=0):
         if i >= len(chain):
