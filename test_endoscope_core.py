@@ -37,6 +37,9 @@ def load_app():
 
     tk = types.ModuleType("tkinter")
     tkfont = types.ModuleType("tkinter.font")
+    # The real application catches tkinter.TclError in its fullscreen fallback.
+    # Provide the same symbol in this display-free test double.
+    tk.TclError = type("TclError", (Exception,), {})
     tkfont.Font = object
     tk.font = tkfont
     sys.modules.setdefault("tkinter", tk)
@@ -156,6 +159,14 @@ def test_video_flips_are_independent(app):
 
 def test_firmware_composite_contract():
     """Static checks catch accidental removal of the one-cable architecture."""
+    firmware = HERE / "firmware"
+    if not firmware.is_dir():
+        # The field-recovered deployable archive contains the exact prebuilt
+        # firmware image, but not the source tree that produced it.  Treat this
+        # source-only contract as unavailable instead of reporting a false host
+        # regression.  HANDOFF.md records how to restore the source separately.
+        print("SKIP: firmware source contract (source tree not recovered from Pi)")
+        return
     descriptor = (HERE / "firmware/components/usb_device_uvc/tusb/usb_descriptors.c").read_text()
     config = (HERE / "firmware/components/usb_device_uvc/tusb/tusb_config.h").read_text()
     service = (HERE / "firmware/main/service/service_usb_imu.cpp").read_text()
@@ -217,10 +228,10 @@ def test_usb_fault_states(app):
 
 
 def test_fw_version_from_serial_string(app):
-    """v6.0.3+ encodes its version in iSerialNumber for on-screen display."""
-    by_id = ("/dev/serial/by-id/usb-Espressif_AtomS3R-CAM_UVC+IMU_v6.0.3_"
-             "ATOMCAMV603-if04-port0")
-    assert app._fw_version_from_port(by_id) == (6, 0, 3)
+    """v6.0.4 encodes its version in iSerialNumber for on-screen display."""
+    by_id = ("/dev/serial/by-id/usb-Espressif_AtomS3R-CAM_UVC+IMU_v6.0.4_"
+             "ATOMCAMV604-if04-port0")
+    assert app._fw_version_from_port(by_id) == (6, 0, 4)
     assert app._fw_version_from_port("/dev/ttyACM99") is None
 
 
@@ -290,7 +301,7 @@ def main():
     test_fw_version_from_serial_string(app)
     test_v4l2_handle_stays_on_reader_thread(app)
     print("PASS: USB packets, fault states, fw-version, fusion, WebSocket, "
-          "flips, UVC recovery, firmware contract")
+          "flips and host-side UVC recovery")
 
 
 if __name__ == "__main__":

@@ -123,7 +123,7 @@ from PIL import Image, ImageTk
 
 CONFIG = os.path.join(os.path.expanduser("~"), ".config", "endoscope.json")
 SYNC = b"\xa5\x5a"
-APP_VER = "6.1.0"
+APP_VER = "6.0.4"
 CONFIG_REV = 6
 
 # One running instance owns /dev/video* and /dev/ttyACM*. A second launch that
@@ -160,15 +160,6 @@ USB_IMU_FLAG_STATIONARY = 1 << 3
 # leaving the app to mislabel it "connecting" while packets are flowing.
 USB_IMU_FLAG_SENSOR_FAULT = 1 << 4      # BMI270 reads failing right now
 USB_IMU_FLAG_SENSOR_RECOVERED = 1 << 5  # bus+sensor re-init just succeeded
-
-# Independent screen-mounted XIAO nRF52840 Sense telemetry.  This record is
-# deliberately smaller than the camera record: the screen board sends raw
-# accel/gyro and the Pi owns its fusion clock.
-SCREEN_IMU_MAGIC = b"SIMU"
-SCREEN_IMU_VERSION = 1
-SCREEN_IMU_PACKET = struct.Struct("<4sBBHIQ6fI")
-SCREEN_IMU_FLAG_VALID = 1 << 0
-SCREEN_IMU_RATE_HZ = 100
 
 TYPE_IMU = 1
 TYPE_FRAME = 2
@@ -240,17 +231,6 @@ def v_norm(v):
 
 def clamp(x, lo=-1.0, hi=1.0):
     return lo if x < lo else (hi if x > hi else x)
-
-
-def wrap_pi(a):
-    """Wrap radians to (-pi, pi], preserving already-in-range values exactly."""
-    wrapped = math.remainder(a, 2.0 * math.pi)
-    return math.pi if wrapped == -math.pi else wrapped
-
-
-def screen_heading(q):
-    """Quaternion swing-twist heading about world +Z."""
-    return 2.0 * math.atan2(q[3], q[0])
 
 
 # Below this horizontal magnitude the heading of a vector is numerically
@@ -745,43 +725,6 @@ def _fw_version_from_port(port):
     return None
 
 
-def _screen_imu_identity_text(port):
-    """USB identity strings used for positive XIAO detection only."""
-    texts = [os.path.basename(str(port)).lower(),
-             os.path.basename(os.path.realpath(str(port))).lower()]
-    path = os.path.realpath("/sys/class/tty/{}/device".format(
-        os.path.basename(os.path.realpath(str(port)))))
-    for _ in range(7):
-        for name in ("product", "manufacturer"):
-            try:
-                with open(os.path.join(path, name), encoding="utf-8") as f:
-                    texts.append(f.read().strip().lower())
-            except OSError:
-                pass
-        parent = os.path.dirname(path)
-        if parent == path:
-            break
-        path = parent
-    return " ".join(texts)
-
-
-def _is_screen_imu_port(port):
-    try:
-        text = _screen_imu_identity_text(port)
-        return any(token in text for token in ("seeed", "xiao", "nrf52"))
-    except Exception:
-        return False
-
-
-def _same_serial_port(a, b):
-    if not a or not b:
-        return False
-    try:
-        return os.path.realpath(str(a)) == os.path.realpath(str(b))
-    except Exception:
-        return str(a) == str(b)
-
-
 def find_usb_imu_port(preferred=None):
     """Find the CDC interface of the v6 UVC+IMU composite device.
 
@@ -802,10 +745,6 @@ def find_usb_imu_port(preferred=None):
     ranked = []
     for pattern in ("/dev/ttyACM*", "/dev/ttyUSB*"):
         for port in sorted(glob.glob(pattern)):
-            # A positively identified screen-mounted XIAO belongs to the
-            # independent raw-IMU link, never to the camera fallback.
-            if _is_screen_imu_port(port):
-                continue
             text = []
             path = os.path.realpath("/sys/class/tty/{}/device".format(
                 os.path.basename(port)))
@@ -833,51 +772,6 @@ def find_usb_imu_port(preferred=None):
     if not ranked:
         return None
     return max(ranked, key=lambda item: (item[0], item[1]))[1]
-
-
-def find_screen_imu_port(preferred=None):
-    """Find only a positively identified screen XIAO, never the camera CDC."""
-    try:
-        camera_port = find_usb_imu_port()
-    except Exception:
-        camera_port = None
-
-    if preferred:
-        # An explicit port is honoured or nothing -- never silently autodetect a
-        # different device than the operator named (matches find_usb_imu_port).
-        try:
-            if os.path.exists(preferred) and not _same_serial_port(
-                    preferred, camera_port):
-                return preferred
-        except Exception:
-            pass
-        return None
-
-    candidates = []
-    try:
-        candidates.extend(sorted(glob.glob("/dev/serial/by-id/*")))
-    except Exception:
-        pass
-    for pattern in ("/dev/ttyACM*", "/dev/ttyUSB*"):
-        try:
-            candidates.extend(sorted(glob.glob(pattern)))
-        except Exception:
-            pass
-
-    seen = set()
-    for port in candidates:
-        try:
-            resolved = os.path.realpath(port)
-        except Exception:
-            resolved = str(port)
-        if resolved in seen:
-            continue
-        seen.add(resolved)
-        if (_same_serial_port(port, camera_port)
-                or not _is_screen_imu_port(port)):
-            continue
-        return port
-    return None
 
 
 def find_video(preferred="auto"):
@@ -1218,66 +1112,6 @@ class UsbImuPacketParser:
                 "gyro_dps": tuple(fields[9:12]),
                 "mag_ut": tuple(fields[12:15]),
                 "quaternion": quaternion,
-            })
-        return records
-
-
-class ScreenImuPacketParser:
-    """Recover validated 48-byte screen-IMU records from arbitrary CDC reads."""
-
-    MAX_ACCEL_G = 32.0
-    MAX_GYRO_DPS = 4000.0
-
-    def __init__(self):
-        self.buf = bytearray()
-        self.bad_packets = 0
-
-    def feed(self, chunk):
-        self.buf.extend(chunk)
-        records = []
-        packet_len = SCREEN_IMU_PACKET.size
-
-        while True:
-            start = self.buf.find(SCREEN_IMU_MAGIC)
-            if start < 0:
-                if len(self.buf) > len(SCREEN_IMU_MAGIC) - 1:
-                    del self.buf[:-(len(SCREEN_IMU_MAGIC) - 1)]
-                break
-            if start:
-                del self.buf[:start]
-            if len(self.buf) < 8:
-                break
-
-            version = self.buf[4]
-            declared_len = struct.unpack_from("<H", self.buf, 6)[0]
-            if version != SCREEN_IMU_VERSION or declared_len != packet_len:
-                del self.buf[0]
-                self.bad_packets += 1
-                continue
-            if len(self.buf) < packet_len:
-                break
-
-            raw = bytes(self.buf[:packet_len])
-            del self.buf[:packet_len]
-            fields = SCREEN_IMU_PACKET.unpack(raw)
-            accel = tuple(float(v) for v in fields[6:9])
-            gyro = tuple(float(v) for v in fields[9:12])
-            sane = (all(math.isfinite(v) for v in accel + gyro)
-                    and all(abs(v) <= self.MAX_ACCEL_G for v in accel)
-                    and all(abs(v) <= self.MAX_GYRO_DPS for v in gyro))
-            if ((zlib.crc32(raw[:-4]) & 0xffffffff) != fields[-1]
-                    or not sane):
-                self.bad_packets += 1
-                continue
-
-            flags = fields[2]
-            records.append({
-                "sequence": fields[4],
-                "timestamp_us": fields[5],
-                "flags": flags,
-                "accel": accel,
-                "gyro": gyro,
-                "valid": bool(flags & SCREEN_IMU_FLAG_VALID),
             })
         return records
 
@@ -1934,8 +1768,6 @@ class MahonyFusion:
     BIAS_LEARN = 0.01       # stock IMU WebSocket is 10 Hz, not 100 Hz
     BIAS_CLAMP_DPS = 3.0
     CAL_SAMPLES = 30        # three seconds at the stock 10 Hz rate
-    DT_MAX = 0.5
-    DT_FALLBACK = 0.1
 
     def __init__(self):
         self.reset()
@@ -1993,8 +1825,8 @@ class MahonyFusion:
 
         dt = now - self.last_time
         self.last_time = now
-        if dt <= 0.0 or dt > self.DT_MAX:
-            dt = self.DT_FALLBACK
+        if dt <= 0.0 or dt > 0.5:
+            dt = 0.1
         self._calibrate((gx, gy, gz))
 
         rx, ry, rz = gx - self.bias[0], gy - self.bias[1], gz - self.bias[2]
@@ -2045,210 +1877,6 @@ class MahonyFusion:
         if n > 1e-9:
             self.q = [v / n for v in q]
         return tuple(self.q), self.still
-
-
-class ScreenMahonyFusion(MahonyFusion):
-    """100 Hz screen fusion whose integration clock is XIAO device time."""
-
-    CAL_SAMPLES = 300
-    BIAS_LEARN = 0.001
-    DT_MAX = 0.05
-    DT_FALLBACK = 0.01
-
-    def update(self, accel, gyro, now=None):
-        now = time.monotonic() if now is None else float(now)
-        if self.last_time is None:
-            ax, ay, az = (float(x) for x in accel)
-            self._seed_from_gravity(ax, ay, az)
-            # The first sample after reset represents one nominal 100 Hz step.
-            # Parent MahonyFusion keeps its original seed-only first update.
-            self.last_time = now - self.DT_FALLBACK
-        return super().update(accel, gyro, now)
-
-
-class ScreenImuLink:
-    """Serial-only raw-IMU link for the screen-mounted XIAO."""
-
-    is_screen_imu = True
-
-    def __init__(self, port=None):
-        self.want_port = port
-        self.port = None
-        self.ser = None
-        self.parser = ScreenImuPacketParser()
-        self.fusion = ScreenMahonyFusion()
-        self.lock = threading.Lock()
-        self.quat = (1.0, 0.0, 0.0, 0.0)
-        self.still = False
-        self.state = "searching"
-        self.calibrating = True
-        self.imu_time = 0.0
-        self.generation = 0
-        self.imu_reconnects = 0
-        self.last_imu_error = None
-        self.running = False
-        self.present = False
-        self.bad_packets = 0
-        self.dropped_packets = 0
-        self.last_sequence = None
-        self.last_device_time = None
-        self._awaiting_epoch = True
-        self.thread = None
-
-    def start(self):
-        if self.running:
-            return self
-        self.running = True
-        self.thread = threading.Thread(target=self._manager, daemon=True,
-                                       name="screen-imu-reader")
-        self.thread.start()
-        return self
-
-    def stop(self, timeout=1.5):
-        self.running = False
-        ser = self.ser
-        if ser is not None:
-            try:
-                ser.close()
-            except Exception:
-                pass
-            if self.ser is ser:
-                self.ser = None
-        thread = self.thread
-        if thread is not None and thread is not threading.current_thread():
-            try:
-                thread.join(timeout=timeout)
-            except Exception:
-                pass
-            if not thread.is_alive():
-                self.thread = None
-
-    def snapshot_locked(self):
-        with self.lock:
-            return {"quat": self.quat, "state": self.state,
-                    "calibrating": self.calibrating,
-                    "imu_time": self.imu_time,
-                    "generation": self.generation, "still": self.still}
-
-    def _set_state(self, state, error=None, reconnect=False):
-        with self.lock:
-            self.state = state
-            if error is not None:
-                self.last_imu_error = str(error)
-            if reconnect:
-                self.imu_reconnects += 1
-
-    def _begin_epoch(self):
-        # Reset before publishing any sample from the new device-time epoch.
-        self.fusion.reset()
-        self.last_sequence = None
-        self.last_device_time = None
-        with self.lock:
-            self.generation += 1
-
-    def _accept_record(self, record):
-        try:
-            if not (record["flags"] & SCREEN_IMU_FLAG_VALID):
-                return False
-            accel = tuple(float(v) for v in record["accel"])
-            gyro = tuple(float(v) for v in record["gyro"])
-            if not all(math.isfinite(v) for v in accel + gyro):
-                return False
-            timestamp_us = int(record["timestamp_us"])
-            sequence = int(record["sequence"]) & 0xffffffff
-
-            backwards = (self.last_device_time is not None
-                         and timestamp_us < self.last_device_time)
-            if self._awaiting_epoch or backwards:
-                self._begin_epoch()
-                self._awaiting_epoch = False
-
-            if self.last_sequence is not None:
-                gap = (sequence - self.last_sequence - 1) & 0xffffffff
-                if 0 < gap < 100000:
-                    self.dropped_packets += gap
-            self.last_sequence = sequence
-            self.last_device_time = timestamp_us
-
-            quat, still = self.fusion.update(
-                accel, gyro, timestamp_us / 1000000.0)
-            host_now = time.monotonic()
-            with self.lock:
-                self.quat = quat
-                self.still = still
-                self.calibrating = not self.fusion.calibrated
-                self.imu_time = host_now
-                self.state = ("connecting" if self.calibrating else "online")
-            return True
-        except Exception:
-            # A malformed record is equivalent to an invalid sample. It must
-            # neither advance device time nor escape into the UI thread.
-            return False
-
-    def _manager(self):
-        while self.running:
-            try:
-                port = find_screen_imu_port(self.want_port)
-            except Exception as exc:
-                self._set_state("offline", exc, reconnect=True)
-                if self.running:
-                    time.sleep(1.0)
-                continue
-
-            if port is None:
-                self._set_state("searching")
-                time.sleep(1.0)
-                continue
-
-            self._set_state("connecting")
-            try:
-                ser = serial.Serial()
-                ser.port = port
-                ser.baudrate = 115200
-                ser.timeout = 0.5
-                ser.write_timeout = 0.3
-                ser.dtr = True
-                ser.rts = False
-                try:
-                    ser.exclusive = True
-                except (AttributeError, ValueError):
-                    pass
-                ser.open()
-                self.ser = ser
-                self.port = port
-                self.parser = ScreenImuPacketParser()
-                self._awaiting_epoch = True
-                self.last_sequence = None
-                self.last_device_time = None
-                last_valid = time.monotonic()
-
-                while self.running:
-                    chunk = ser.read(ser.in_waiting or 1)
-                    if chunk:
-                        with self.lock:
-                            self.present = True
-                        bad_before = self.parser.bad_packets
-                        records = self.parser.feed(chunk)
-                        self.bad_packets += self.parser.bad_packets - bad_before
-                        for record in records:
-                            if self._accept_record(record):
-                                last_valid = time.monotonic()
-                    if time.monotonic() - last_valid > 8.0:
-                        raise TimeoutError(
-                            "screen IMU: no valid packet for 8 seconds")
-            except Exception as exc:
-                if self.running:
-                    self._set_state("offline", exc, reconnect=True)
-            finally:
-                ser = self.ser
-                if ser is not None:
-                    try:
-                        ser.close()
-                    except Exception:
-                        pass
-                self.ser = None
-            if self.running:
-                time.sleep(1.0)
 
 
 class WsJsonStream:
@@ -2792,29 +2420,6 @@ class Indicator:
 
 # ------------------------------------------------------------- application
 
-def _screen_imu_settings(cfg, args):
-    """Merge screen defaults, saved config and explicit CLI overrides."""
-    saved = cfg.get("screen_imu") if isinstance(cfg, dict) else None
-    saved = saved if isinstance(saved, dict) else {}
-    enabled = bool(saved.get("enabled", True))
-    port = saved.get("port", None)
-    try:
-        sign = int(saved.get("sign", 1))
-    except (TypeError, ValueError):
-        sign = 1
-    if sign not in (-1, 1):
-        sign = 1
-
-    cli_port = getattr(args, "screen_imu_port", None)
-    cli_sign = getattr(args, "screen_imu_sign", None)
-    if cli_port is not None:
-        port = cli_port
-    if cli_sign is not None:
-        sign = int(cli_sign)
-    if getattr(args, "no_screen_imu", False):
-        enabled = False
-    return {"enabled": enabled, "port": port, "sign": sign}
-
 class App:
     STAGE_SETUP = 0      # instructions, no indicator yet
     STAGE_CHECK = 1      # zeroed; verify before entering the live view
@@ -2830,24 +2435,7 @@ class App:
                                 getattr(link, "camera", None) is not None)
         self.axis_idx = int(self.cfg.get("axis", 0)) % len(AXES)
         self.q_ref = None
-        self.scr_q_ref = None
-        self.scr_zero_gen = None
         self.zero_gen = -1              # link generation the zero belongs to
-        self.screen_imu_cfg = _screen_imu_settings(self.cfg, args)
-        # Persist only config-level values; a one-time CLI flag (e.g.
-        # --no-screen-imu) must not become sticky on disk. object() carries no
-        # screen_imu_* / no_screen_imu attributes, so _screen_imu_settings reads
-        # config+defaults with no CLI override.
-        self.cfg["screen_imu"] = _screen_imu_settings(self.cfg, object())
-        self.screen_sign = self.screen_imu_cfg["sign"]
-        self.screen_link = None
-        if self.screen_imu_cfg["enabled"]:
-            try:
-                self.screen_link = ScreenImuLink(
-                    self.screen_imu_cfg["port"]).start()
-            except Exception:
-                self.screen_link = None
-        self._screen_generation_seen = None
         self.zero_time = 0.0
         self.peak_az = 0.0
         self.axis_det = None            # armed by capture_zero
@@ -3045,44 +2633,29 @@ class App:
                     "rot180": False,
                     "video_flip_h": False,
                     "video_flip_v": False,
-                    "awb": False, "swap_rb": False,
-                    "screen_imu": {"enabled": True, "port": None,
-                                   "sign": 1}}
+                    "awb": False, "swap_rb": False}
         except Exception:
-            return {"config_rev": CONFIG_REV,
-                    "screen_imu": {"enabled": True, "port": None,
-                                   "sign": 1}}
+            return {"config_rev": CONFIG_REV}
 
     def save_cfg(self):
         try:
             os.makedirs(os.path.dirname(CONFIG), exist_ok=True)
-            out = dict(self.cfg)
-            # Persist the config-level screen settings (self.cfg), NOT the
-            # CLI-merged runtime settings (self.screen_imu_cfg): a per-run flag
-            # like --no-screen-imu must not become sticky on disk.
-            screen_cfg = dict(self.cfg.get("screen_imu")
-                              or {"enabled": True, "port": None, "sign": 1})
-            out.update({"config_rev": CONFIG_REV,
-                        "axis": self.axis_idx,
-                        "rot180": self.rot180,
-                        "video_flip_h": self.video_flip_h,
-                        "video_flip_v": self.video_flip_v,
-                        "el_sign": self.el_sign,
-                        "awb": self.awb,
-                        "swap_rb": self.swap_rb,
-                        "tune": self.tune_saved,
-                        "cal": {"gains": self.pi_gains,
-                                "chan": self.pi_chan,
-                                "bright": self.pi_bright,
-                                "sat": self.pi_sat,
-                                "black": self.pi_black,
-                                "white": self.pi_white,
-                                "gamma": self.pi_gamma,
-                                "matrix": self.pi_matrix},
-                        "screen_imu": screen_cfg})
             with open(CONFIG, "w", encoding="utf-8") as f:
-                json.dump(out, f)
-            self.cfg = out
+                json.dump({"config_rev": CONFIG_REV,
+                           "axis": self.axis_idx,
+                           "rot180": self.rot180,
+                           "video_flip_h": self.video_flip_h,
+                           "video_flip_v": self.video_flip_v,
+                           "el_sign": self.el_sign,
+                           "awb": self.awb,
+                           "swap_rb": self.swap_rb,
+                           "tune": self.tune_saved,
+                           "cal": {"gains": self.pi_gains, "chan": self.pi_chan,
+                                   "bright": self.pi_bright, "sat": self.pi_sat,
+                                   "black": self.pi_black,
+                                   "white": self.pi_white,
+                                   "gamma": self.pi_gamma,
+                                   "matrix": self.pi_matrix}}, f)
         except Exception:
             pass
 
@@ -3234,67 +2807,6 @@ class App:
                 and not h.get("calibrating", False)
                 and h.get("calib_ok") is not False)
 
-    def _screen_az_correction(self):
-        """Return the screen yaw delta, or exactly 0.0 when unavailable."""
-        try:
-            link = self.screen_link
-            if link is None or not link.present or self.scr_q_ref is None:
-                return 0.0
-            snap = link.snapshot_locked()
-            if (snap["state"] != "online" or snap["calibrating"]
-                    or time.monotonic() - snap["imu_time"] >= 1.0
-                    or snap["generation"] != self.scr_zero_gen):
-                return 0.0
-            q_now = tuple(float(v) for v in snap["quat"])
-            q_ref = tuple(float(v) for v in self.scr_q_ref)
-            if (len(q_now) != 4 or len(q_ref) != 4
-                    or not all(math.isfinite(v) for v in q_now + q_ref)
-                    or q_now[0] * q_now[0] + q_now[3] * q_now[3] < 1e-6
-                    or q_ref[0] * q_ref[0] + q_ref[3] * q_ref[3] < 1e-6):
-                return 0.0
-            corr = self.screen_sign * wrap_pi(
-                screen_heading(q_now) - screen_heading(q_ref))
-            return corr if math.isfinite(corr) else 0.0
-        except Exception:
-            return 0.0
-
-    def _screen_generation_notice(self):
-        """Toast once when a running screen IMU starts a new time epoch."""
-        try:
-            link = self.screen_link
-            if link is None or not link.present:
-                return
-            generation = link.snapshot_locked()["generation"]
-            if generation <= 0:
-                return
-            previous = self._screen_generation_seen
-            self._screen_generation_seen = generation
-            if (previous is not None and generation != previous
-                    and self.stage == self.STAGE_RUN):
-                self.toast("SCREEN IMU RESET — ZERO AGAIN", WARN, ms=2600)
-        except Exception:
-            pass
-
-    def _screen_status_bit(self):
-        try:
-            link = self.screen_link
-            if link is None or not link.present:
-                return None
-            snap = link.snapshot_locked()
-            if (snap["state"] == "online" and not snap["calibrating"]
-                    and time.monotonic() - snap["imu_time"] < 1.0):
-                return "SCR ok"
-            if link.imu_reconnects:
-                return "SCR retry{}".format(link.imu_reconnects)
-            # Connected but still doing its initial calibration (or briefly
-            # quiet before the first reconnect): that is not an error state.
-            return "SCR …"
-        except Exception:
-            try:
-                return "SCR retry{}".format(self.screen_link.imu_reconnects)
-            except Exception:
-                return None
-
     def capture_zero(self):
         if getattr(self.link, "is_usb_composite", False):
             # Sample reference and epoch atomically; a concurrent reconnect
@@ -3323,23 +2835,6 @@ class App:
         # A saved axis can be stale after hardware, case or firmware changes.
         # The deliberate tilt-up check proves it for this zero/reference.
         self.axis_verified = False
-        try:
-            screen_link = getattr(self, "screen_link", None)
-            snap = (screen_link.snapshot_locked()
-                    if screen_link is not None and screen_link.present else None)
-            healthy = (snap is not None and snap["state"] == "online"
-                       and not snap["calibrating"]
-                       and time.monotonic() - snap["imu_time"] < 1.0)
-            if healthy:
-                self.scr_q_ref = snap["quat"]
-                self.scr_zero_gen = snap["generation"]
-                self._screen_generation_seen = snap["generation"]
-            else:
-                self.scr_q_ref = None
-                self.scr_zero_gen = None
-        except Exception:
-            self.scr_q_ref = None
-            self.scr_zero_gen = None
         return True
 
     # ---- stage 1: instructions, indicator deliberately absent
@@ -3429,8 +2924,6 @@ class App:
         """Live picture with no aim reference, clearly labelled as such."""
         self.video_only = True
         self.q_ref = None
-        self.scr_q_ref = None
-        self.scr_zero_gen = None
         self.notice = ""
         self.set_stage(self.STAGE_RUN)
 
@@ -3926,10 +3419,7 @@ class App:
     def update(self):
         frame, seq, q, still = self.link.snapshot()
         h = self.link.health()
-        self._screen_generation_notice()
         az, el = aim_angles(q, self.q_ref, self.axis_idx, self.el_sign)
-        corr = self._screen_az_correction()
-        az = wrap_pi(az + corr) if corr else az
         self._log_row(az, el, q, still)
 
         # A probe restart (new generation) restarts its orientation estimate,
@@ -3938,8 +3428,6 @@ class App:
         if (self.stage != self.STAGE_SETUP and self.q_ref is not None
                 and h["generation"] != self.zero_gen):
             self.q_ref = None
-            self.scr_q_ref = None
-            self.scr_zero_gen = None
             self.notice = "PROBE RESTARTED \u2014 ZERO AGAIN"
             self.set_stage(self.STAGE_SETUP)
             self.root.after(40, self.update)
@@ -4006,8 +3494,6 @@ class App:
                         # Heading is defined per-axis, so recompute this
                         # frame's angles and restart the drift peak.
                         az, el = aim_angles(q, self.q_ref, self.axis_idx, self.el_sign)
-                        corr = self._screen_az_correction()
-                        az = wrap_pi(az + corr) if corr else az
                         self.peak_az = 0.0
                         self.toast("LENS AXIS AUTO-SET: "
                                    + AXES[hit][0] + " \u2713", OK, ms=2400)
@@ -4128,9 +3614,6 @@ class App:
                 text="AZ {:+.0f}\u00b0   EL {:+.0f}\u00b0".format(
                     math.degrees(az), math.degrees(el)))
             bits = ["{:.0f} fps".format(h["fps"])]
-            screen_bit = self._screen_status_bit()
-            if screen_bit:
-                bits.append(screen_bit)
             if self.video_flip_h:
                 bits.append("MIRROR")
             if self.video_flip_v:
@@ -5140,12 +4623,6 @@ def main():
                          "use it to check the camera or to work without the IMU.")
     ap.add_argument("--sim", action="store_true",
                     help="synthetic probe: run the whole UI with no hardware")
-    ap.add_argument("--screen-imu-port", default=None, metavar="PORT",
-                    help="screen XIAO serial node (positive-ID auto-detected if omitted)")
-    ap.add_argument("--no-screen-imu", action="store_true", default=False,
-                    help="disable the screen-mounted IMU")
-    ap.add_argument("--screen-imu-sign", type=int, choices=(1, -1), default=None,
-                    help="screen mounting handedness (1 or -1)")
     ap.add_argument("--log", metavar="FILE.csv",
                     help="record time, az, el, quaternion for drift analysis")
     args = ap.parse_args()
@@ -5186,9 +4663,6 @@ def main():
     try:
         app.run()
     finally:
-        screen_link = getattr(app, "screen_link", None)
-        if screen_link is not None:
-            screen_link.stop()
         if (getattr(link, 'camera', None) and
                 not getattr(link, 'is_uvc', False)):
             link.camera.stop()

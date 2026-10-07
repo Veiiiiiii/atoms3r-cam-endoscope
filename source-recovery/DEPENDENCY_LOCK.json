@@ -1,0 +1,74 @@
+{
+  "release": "6.0.4",
+  "idf_tag": "v5.1.4",
+  "idf_commit": "d7b0a45ddbddbac53afb4fc28168f9f9259dbb79",
+  "components": [
+    {
+      "url": "https://github.com/Forairaaaaa/mooncake.git",
+      "path": "components/mooncake",
+      "branch": "v1.2",
+      "commit": "52ce99196438ba03706cbb6aca33049520ccba3e"
+    },
+    {
+      "url": "https://github.com/Forairaaaaa/arduino_lite.git",
+      "path": "components/arduino-esp32",
+      "branch": "v3.0.2",
+      "commit": "874612162be847a323096030529effc90cd88dd5"
+    },
+    {
+      "url": "https://github.com/bblanchon/ArduinoJson.git",
+      "path": "components/ArduinoJson",
+      "branch": "v7.0.4",
+      "commit": "36e1eecc7d246d829bc51e61d6ac541893c646a3"
+    },
+    {
+      "url": "https://github.com/espressif/esp32-camera.git",
+      "path": "components/esp32-camera",
+      "branch": "v2.0.10",
+      "commit": "7aa37d4f22503fdac9ccd449e4678c4894c40055"
+    },
+    {
+      "url": "https://github.com/Forairaaaaa/M5GFX.git",
+      "path": "components/M5GFX",
+      "branch": "0.1.16-with-arduino-as-component",
+      "commit": "ff7d8de0d828243e4b860ee08594ac5906f4dd6a"
+    },
+    {
+      "url": "https://github.com/m5stack/M5Unified.git",
+      "path": "components/M5Unified",
+      "branch": "0.1.16",
+      "commit": "e0dd4f8543f91f42b455536f758d2bda80f51f4b"
+    },
+    {
+      "url": "https://github.com/espressif/tinyusb.git",
+      "path": "components/espressif__tinyusb",
+      "ref": "33d36cb23d6f8415d0e8a09d15a5e6cd8c0a6d05",
+      "commit": "33d36cb23d6f8415d0e8a09d15a5e6cd8c0a6d05"
+    }
+  ],
+  "idf_submodules": [
+    " 24c60e243580c7868f4334a1ba3123481fe1aa48 components/bootloader/subproject/components/micro-ecc/micro-ecc (24c60e2)",
+    " 79c3d50f699efee7c4a1b80604e96fd2a355311b components/bt/controller/lib_esp32 (79c3d50)",
+    " ea4595a5630326d428ee3457df654e1840b5e101 components/bt/controller/lib_esp32c2/esp32c2-bt-lib (ea4595a)",
+    " e5c0f7256ecf5b5f8eb28c1793051a6b88f95124 components/bt/controller/lib_esp32c3_family (e5c0f72)",
+    " 0af472c6f95858e638565dad19a79fe47de1fff2 components/bt/controller/lib_esp32c6/esp32c6-bt-lib (0af472c)",
+    " 70612d08d1ff94dfb5da99d6a68aa4032cd63276 components/bt/controller/lib_esp32h2/esp32h2-bt-lib (70612d0)",
+    " 299279a46795a6de44c2683cae6f85e0c68cb551 components/bt/host/nimble/nimble (299279a)",
+    " eeecc49ce8af123cf8ad40efdb9673e37b56230f components/cmock/CMock (eeecc49)",
+    " 71b47be7c950f1bf5f7e5303779fa99a16224bb6 components/cmock/CMock/vendor/c_exception (71b47be)",
+    " cf949f45ca6d172a177b00da21310607b97bc7a7 components/cmock/CMock/vendor/unity (cf949f4)",
+    " 2717868407a01878a49d19794538b6da120597ae components/esp_coex/lib (2717868)",
+    " 792ba5917ee8191e7264143e69f9e6f8c1c0eacc components/esp_phy/lib (792ba59)",
+    " 13050c315660b0729dc654586a4183a144fcf244 components/esp_wifi/lib (13050c31)",
+    " d2e28f872472ffc6a704faae65ddee1f24e2dfba components/heap/tlsf (d2e28f8)",
+    " 87d8f0961a01bf09bef98ff89bae9fdec42181ee components/json/cJSON (87d8f09)",
+    " f79221431fa9042b3572d271d687de66da7560c4 components/lwip/lwip (f7922143)",
+    " 09bba150d0d822aad2e58d71723f5407da5c21e0 components/mbedtls/mbedtls (09bba150d)",
+    " e6afdb4025fe018ae0add44e3c45249ea1974774 components/mqtt/esp-mqtt (e6afdb4)",
+    " fcee30db4b7342de4df9105bdd049a09d2d63187 components/openthread/lib (fcee30d)",
+    " 456c448284486abe2a9118a9fdaa468fe2383fcd components/openthread/openthread (456c44828)",
+    " abc67a11c6db271bedbb9f58be85d6f4e2ea8389 components/protobuf-c/protobuf-c (abc67a1)",
+    " 0dbb3f71c5f6fae3747a9d935372773762baf852 components/spiffs/spiffs (0dbb3f7)",
+    " 7d2bf62b7e6afaf38153041a9d53c21aeeca9a25 components/unity/unity (7d2bf62)"
+  ]
+}

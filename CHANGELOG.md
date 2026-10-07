@@ -1,5 +1,19 @@
 # Changelog
 
+## 6.1.0 — screen-mounted gyro: camera-relative-to-screen azimuth
+
+- New optional 2nd 6-axis IMU on the screen body (Seeed XIAO nRF52840 Sense,
+  LSM6DS3TR-C) over USB-CDC. The on-screen arrow now tracks the camera relative
+  to the *current* screen pose (azimuth-only; elevation stays gravity-absolute).
+- Adds `screen_imu/` XIAO firmware, `SCREEN_IMU_GUIDE_CN.md`, `test_screen_gyro.py`.
+- endoscope.py differs from the approved v6.0.4 working file ONLY by this feature
+  (+ APP_VER 6.1.0, a behaviour-preserving MahonyFusion DT_* constant extraction,
+  and screen_imu config save/load). No-op and bit-identical when the screen IMU is
+  absent; no change to video/colour/mirror-flip/elevation/camera-ZERO/field-patches.
+- Host unit suites green; on-device flash/fusion/sign/e2e require the physical XIAO.
+- handoff/history keeps the approved v6.0.4 endoscope.py as
+  `endoscope.py.v6.0.4-approved-before-screen-gyro`.
+
 ## 6.0.4 — source changes; validation in TEST_REPORT.md
 
 - Physical fullscreen target and one borderless fallback.

@@ -1,38 +1,27 @@
-# v6.0.4 validation — 2026-09-09
+# v6.0.4 operational recovery validation — 2026-09-11
 
-This record describes THIS restored workspace, not the lost earlier build.
+## Recovered artifacts
 
-## Build: PASS
+- Raspberry Pi working-copy ZIP downloaded from GitHub Release and passed ZIP CRC validation.
+- Final host `endoscope.py`: 202,504 bytes.
+- Merged firmware `release/atoms3r_cam_uvc_imu_v6_0_4.bin`: 837,184 bytes.
+- Firmware contains the expected `AtomS3R-CAM UVC+IMU v6.0.4` and `ATOMCAMV604` identity strings.
+- Firmware hash matches the hash recorded by the earlier successful ESP-IDF build.
 
-ESP-IDF v5.1.4 with recursive submodules aligned (DEPENDENCY_LOCK.json).
-CMake3.31.10, Ninja1.13.0, Python3.12. Full build 1064/1064 completed and merge
-exited 0. Inherited deprecated I2S/I2C API warnings remain, with no compile errors.
-Actual full build log: evidence/build604.log. Earlier dependency errors are
-preserved in evidence for provenance; they were resolved before this build.
+## Tests executed in the recovery workspace
 
-- App size 0xbc640 (771648 bytes), 63% of 2MiB partition free.
-- Merged image atoms3r_cam_uvc_imu_v6_0_4.bin: 837184 bytes (0xcc640).
-- SHA256 `1661001147a39bcc75665b43ebfd25d3ee7d4f635894d9c7695a9754534daeae`.
-- Boot 0x0, partitions 0x8000, app 0x10000; magic values checked.
-- Merged application bytes exactly match the generated application bin.
-- New USB serial ATOMCAMV604 present; app image metadata separately inspected
-  in evidence/application-image-info.txt.
-- DIO/80MHz/8MB settings retained from the established firmware build.
+- `python3 -m py_compile`: PASS for application and both Python test files.
+- Host regression suite: PASS for packet/CRC recovery, link fault states, version parsing, fusion fallback, video flips and V4L2 capture ownership/reopen.
+- Final-field-patch suite: PASS for fullscreen retry, manual ZERO, device epoch invalidation, heartbeat, DTR and invalid-packet timeout recovery.
+- `bash -n`: PASS for every shipped shell script.
+- ZIP CRC and clean-room extraction: PASS after packaging.
 
-## Software: PASS
+The firmware source-only static contract test is explicitly SKIPPED because the exact ESP-IDF `firmware/` tree was not present in the Pi recovery. This is not represented as a source-build pass.
 
-Evidence: evidence/software-tests.txt. Python syntax and baseline host regressions,
-new fullscreen/refused-WM/windowed cases, stationary/fresh ZERO gating, firmware
-timestamp rollback, heartbeat/DTR timeout on absent AND garbage serial input.
-Native C++17 tests include actual production imu_math.h: startup bias, rejection
-of uniform motion and slow tilt, static timing, sample-gap reset, 90-degree
-out/back integration and acceleration gating. All root shell scripts pass bash -n.
+## Hardware evidence
 
-## Not tested physically
+The user reported that video, long-running IMU, ZERO, fullscreen and requested controls all worked after the two final field patches. No quantified one-hour log, thermal drift dataset or medical-device validation was supplied. The exact physical result cannot be reproduced inside this hardware-free environment.
 
-The exact Pi window manager, USB electrical/endpoint timing, repeated close/open,
-one-hour simultaneous video/IMU endurance, sensor temperature drift and measured
-return-angle accuracy. Static holding may suppress extremely slow pure yaw.
-CDC last-resort restart interrupts both USB interfaces and requires a new ZERO.
-Build/tests alone do not prove every reported fault is eliminated. Follow field
-acceptance in HANDOFF.md before treating this as hardware-qualified.
+## Release corrections
+
+The Pi archive contained the correct v6.0.4 binary at project root while the flash scripts expected it under `release/`; the operational package places the exact same binary under the required path. The older ambiguous `release/atoms3r_cam_uvc_imu_v6.bin`, temporary files and stale Arduino route were excluded.
