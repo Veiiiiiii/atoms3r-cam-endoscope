@@ -77,6 +77,7 @@ SETUP ON THE PI
 import argparse
 import base64
 import csv
+from dataclasses import asdict, dataclass
 import errno
 import fcntl
 import glob
@@ -93,6 +94,7 @@ import sys
 import threading
 import time
 import zlib
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlsplit
 
 try:
@@ -2416,6 +2418,689 @@ class Indicator:
             t0 = a0 + arrow_len * (i / n)
             w = arrow_w * (1.0 - i / n)
             poly([pt(t0, w), pt(t0, -w), tip_pt], fill=g, outline="")
+
+
+# --------------------------------------------------------- UV fluorescence
+#
+# Ported from UVScope 1.1 (Desktop\UVScope\UVScope1.1\uvscope\core.py), the
+# Windows tool used to tune this: same yellow-filter LUT, same per-ROI
+# fluorescence boost, same box tracker, same math -- just fed frames
+# straight from the probe's camera instead of a video file, with an added
+# draw=False fast path so the live view can paint boxes/labels itself at
+# DISPLAY resolution (crisp lines on a small screen) instead of baking them
+# into the analysis-size buffer. UV-PORT-PLAN.md §3.2/§3.9 is the contract;
+# test_uv_core.py proves bit-for-bit parity against UVScope at scale 1.
+#
+# D8 / §3.2 -- why there is a "scale" at all: UVScope was tuned against a
+# 360px-short-side feed (the tuning videos were 360x640 portrait). A Pi
+# camera is rarely exactly that, so every pixel-unit parameter (open_px,
+# merge_px, feather_px, box_thickness) is rescaled by
+# (relevant short side / UV_REF_SHORT_SIDE) before use. That keeps one
+# uv_params.json looking the same regardless of capture resolution. At
+# scale 1 the rescale is a no-op (round(v*1) == v), so nothing here changes
+# UVScope's own behaviour on its own tuning videos.
+
+UV_REF_SHORT_SIDE = 360          # short side (px) UVScope's defaults were tuned at
+
+# Factory defaults, verbatim from Desktop\UVScope\UVScope 1.0\uv_params.json
+# (== UVScope1.1's copy -- D3). This is the ONE place these numbers live;
+# UVParams' field defaults below read straight out of this dict so the two
+# can never drift apart.
+UV_FACTORY: Dict[str, Any] = {
+    "filter_enabled": False,
+    "filter_strength": 0.9,
+    "blue_cut": 0.77,
+    "warmth": 0.15,
+    "exposure": 1.16,
+    "gamma": 1.27,
+    "detect_enabled": True,
+    "sensitivity": 50.0,
+    "hue_min": 42,
+    "hue_max": 110,
+    "sat_min": 84,
+    "val_min": 188,
+    "uv_reject": False,
+    "uv_reject_min": 31,
+    "open_px": 0,
+    "merge_px": 27,
+    "min_area_ratio": 0.00199,
+    "max_regions": 40,
+    "boost_enabled": True,
+    "boost_sat": 4.0,
+    "boost_val": 1.38,
+    "boost_blue_cut": 0.84,
+    "feather_px": 13,
+    "draw_boxes": True,
+    "box_bgr": (255, 0, 255),
+    "box_thickness": 1,
+    "show_labels": False,
+    "show_hud": False,
+    "draw_contours": False,
+    "track_enabled": True,
+    "track_min_hits": 2,
+    "track_max_miss": 5,
+    "track_alpha": 0.44,
+    "analysis_width": 640,
+}
+
+# UVScope's own PANEL slider ranges (MainWindow.PANEL in uvscope/ui.py),
+# used by UVParams.from_dict() to clamp a hand-edited or imported JSON back
+# into values the detector/boost code was tuned for. min_area_ratio's UI
+# shows the value x100 (a slider 0.002..2.0 that edits a 0.00002..0.02
+# fraction) -- the range below is the underlying fraction, already divided
+# back down. The last four fields have no slider in UVScope's panel; their
+# ranges are only safety rails (a negative analysis_width would ask
+# cv2.resize for a negative size). Every bool and box_bgr is type-coerced.
+UV_UI_RANGES: Dict[str, Tuple[float, float]] = {
+    "max_regions": (1, 200),
+    "track_min_hits": (1, 30),
+    "track_max_miss": (0, 60),
+    "analysis_width": (0, 4096),
+    "filter_strength": (0.0, 1.0),
+    "blue_cut": (0.0, 1.0),
+    "warmth": (0.0, 0.6),
+    "exposure": (0.3, 3.0),
+    "gamma": (0.4, 2.5),
+    "sensitivity": (0.0, 100.0),
+    "hue_min": (0, 179),
+    "hue_max": (0, 179),
+    "sat_min": (0, 255),
+    "val_min": (0, 255),
+    "uv_reject_min": (0, 80),
+    "min_area_ratio": (0.00002, 0.02),
+    "merge_px": (0, 41),
+    "open_px": (0, 15),
+    "boost_sat": (1.0, 4.0),
+    "boost_val": (1.0, 3.0),
+    "boost_blue_cut": (0.0, 0.9),
+    "feather_px": (0, 31),
+    "box_thickness": (1, 8),
+    "track_alpha": (0.0, 0.9),
+}
+
+_UV_BOOL_FIELDS = {"filter_enabled", "detect_enabled", "uv_reject", "boost_enabled",
+                   "draw_boxes", "show_labels", "show_hud", "draw_contours", "track_enabled"}
+_UV_INT_FIELDS = {"hue_min", "hue_max", "sat_min", "val_min", "uv_reject_min", "open_px",
+                  "merge_px", "max_regions", "feather_px", "box_thickness", "track_min_hits",
+                  "track_max_miss", "analysis_width"}
+_UV_FLOAT_FIELDS = {"filter_strength", "blue_cut", "warmth", "exposure", "gamma", "sensitivity",
+                    "min_area_ratio", "boost_sat", "boost_val", "boost_blue_cut", "track_alpha"}
+
+
+def _uv_finite(value):
+    """float(value), refusing bools, None, NaN and +/-inf (ValueError)."""
+    if value is None or isinstance(value, bool):
+        raise ValueError("not a number")
+    f = float(value)
+    if not math.isfinite(f):
+        raise ValueError("not finite")
+    return f
+
+
+def _uv_bool(value):
+    """A JSON-ish truth value: real bools, finite numbers, and the strings
+    true/false/yes/no/on/off/1/0. bool("false") is True, so strings must
+    be parsed rather than cast."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        s = value.strip().lower()
+        if s in ("1", "true", "yes", "on"):
+            return True
+        if s in ("0", "false", "no", "off"):
+            return False
+        raise ValueError("not a truth value")
+    return _uv_finite(value) != 0.0
+
+
+@dataclass
+class UVParams:
+    """All UV tunables. Field names/semantics match UVScope's UVParams
+    exactly (so a uv_params.json made by one tool loads in the other) but
+    the defaults here are the FACTORY preset (UV_FACTORY / D3), not
+    UVScope's own hand-picked class defaults -- the first time a customer
+    ever turns UV mode on, it must look like the factory preset, not like
+    whatever UVScope's author was using to develop the detector."""
+
+    filter_enabled: bool = UV_FACTORY["filter_enabled"]
+    filter_strength: float = UV_FACTORY["filter_strength"]
+    blue_cut: float = UV_FACTORY["blue_cut"]
+    warmth: float = UV_FACTORY["warmth"]
+    exposure: float = UV_FACTORY["exposure"]
+    gamma: float = UV_FACTORY["gamma"]
+
+    detect_enabled: bool = UV_FACTORY["detect_enabled"]
+    sensitivity: float = UV_FACTORY["sensitivity"]
+    hue_min: int = UV_FACTORY["hue_min"]
+    hue_max: int = UV_FACTORY["hue_max"]
+    sat_min: int = UV_FACTORY["sat_min"]
+    val_min: int = UV_FACTORY["val_min"]
+    uv_reject: bool = UV_FACTORY["uv_reject"]
+    uv_reject_min: int = UV_FACTORY["uv_reject_min"]
+    open_px: int = UV_FACTORY["open_px"]
+    merge_px: int = UV_FACTORY["merge_px"]
+    min_area_ratio: float = UV_FACTORY["min_area_ratio"]
+    max_regions: int = UV_FACTORY["max_regions"]
+
+    boost_enabled: bool = UV_FACTORY["boost_enabled"]
+    boost_sat: float = UV_FACTORY["boost_sat"]
+    boost_val: float = UV_FACTORY["boost_val"]
+    boost_blue_cut: float = UV_FACTORY["boost_blue_cut"]
+    feather_px: int = UV_FACTORY["feather_px"]
+
+    draw_boxes: bool = UV_FACTORY["draw_boxes"]
+    box_bgr: Tuple[int, int, int] = UV_FACTORY["box_bgr"]
+    box_thickness: int = UV_FACTORY["box_thickness"]
+    show_labels: bool = UV_FACTORY["show_labels"]
+    show_hud: bool = UV_FACTORY["show_hud"]
+    draw_contours: bool = UV_FACTORY["draw_contours"]
+
+    track_enabled: bool = UV_FACTORY["track_enabled"]
+    track_min_hits: int = UV_FACTORY["track_min_hits"]
+    track_max_miss: int = UV_FACTORY["track_max_miss"]
+    track_alpha: float = UV_FACTORY["track_alpha"]
+
+    analysis_width: int = UV_FACTORY["analysis_width"]
+
+    # -------------------------------------------------------- tool methods
+    def copy(self) -> "UVParams":
+        return UVParams(**asdict(self))
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: Optional[Dict[str, Any]]) -> "UVParams":
+        """Build params from a possibly partial / possibly hand-edited dict:
+        a saved preset, an imported UVScope export, an old config revision.
+        Missing keys fall back to the factory value, unknown keys are
+        dropped, every value is coerced to its proper type, and anything
+        with a UVScope slider range is clamped into it -- so a corrupt or
+        out-of-range file can never hand the detector/boost code a value it
+        wasn't built to survive."""
+        merged = dict(UV_FACTORY)
+        if isinstance(data, dict):
+            for k, v in data.items():
+                if k in merged:
+                    merged[k] = v
+
+        obj = cls()
+        for name, value in merged.items():
+            try:
+                if name == "box_bgr":
+                    seq = list(value) if isinstance(value, (list, tuple)) else []
+                    seq = (seq + list(UV_FACTORY["box_bgr"]))[:3]
+                    value = tuple(max(0, min(255, int(round(_uv_finite(c)))))
+                                  for c in seq)
+                elif name in _UV_BOOL_FIELDS:
+                    value = _uv_bool(value)
+                elif name in _UV_INT_FIELDS:
+                    value = int(round(_uv_finite(value)))
+                    if name in UV_UI_RANGES:
+                        lo, hi = UV_UI_RANGES[name]
+                        value = max(int(lo), min(int(hi), value))
+                elif name in _UV_FLOAT_FIELDS:
+                    value = _uv_finite(value)
+                    if name in UV_UI_RANGES:
+                        lo, hi = UV_UI_RANGES[name]
+                        value = max(float(lo), min(float(hi), value))
+            except (TypeError, ValueError, OverflowError):
+                # json.load accepts Infinity / NaN / 1e999, so a hand-edited
+                # preset can carry them. Unchecked, NaN clamps to the range
+                # MAXIMUM (max sensitivity) instead of failing safe.
+                value = UV_FACTORY[name]          # unusable junk -> factory
+            setattr(obj, name, value)
+        return obj
+
+    def effective_thresholds(self) -> Tuple[int, int, int]:
+        """Map the 0..100 sensitivity slider onto the three real thresholds
+        (identical to UVScope -- see UVScope1.1/uvscope/core.py)."""
+        k = (50.0 - float(self.sensitivity)) / 50.0          # -1 .. +1
+        sat = int(np.clip(self.sat_min + k * 50, 0, 255))
+        val = int(np.clip(self.val_min + k * 70, 0, 255))
+        uvr = int(np.clip(self.uv_reject_min + k * 16, 1, 255))
+        return sat, val, uvr
+
+
+# Dye-type presets (UVScope's PRESETS, English labels only -- D4: no CJK
+# font on the Pi). Keys and detection params are verbatim from
+# UVScope1.1/uvscope/core.py; "red_pink" deliberately wraps hue_min above
+# hue_max (hue_min=160, hue_max=8) to span hue 0, matching UVScope exactly.
+UV_DYE_PRESETS: Dict[str, Dict[str, Any]] = {
+    "yellow_green": dict(
+        label="Yellow-green dye (AC / oil leak)",
+        params=dict(hue_min=20, hue_max=75, sat_min=60, val_min=90,
+                    uv_reject=True, uv_reject_min=18, sensitivity=50)),
+    "green": dict(
+        label="Green fluorescent powder",
+        params=dict(hue_min=35, hue_max=90, sat_min=70, val_min=85,
+                    uv_reject=True, uv_reject_min=22, sensitivity=50)),
+    "orange": dict(
+        label="Orange-yellow powder",
+        params=dict(hue_min=8, hue_max=32, sat_min=80, val_min=95,
+                    uv_reject=True, uv_reject_min=20, sensitivity=50)),
+    "blue_white": dict(
+        label="Blue-white (security ink / brightener)",
+        params=dict(hue_min=95, hue_max=135, sat_min=35, val_min=110,
+                    uv_reject=False, sensitivity=55)),
+    "red_pink": dict(
+        label="Red / pink fluorescence",
+        params=dict(hue_min=160, hue_max=8, sat_min=70, val_min=85,
+                    uv_reject=False, sensitivity=50)),
+    "wide": dict(
+        label="Wide range / high sensitivity",
+        params=dict(hue_min=5, hue_max=95, sat_min=45, val_min=70,
+                    uv_reject=True, uv_reject_min=10, sensitivity=72)),
+}
+
+UV_DEFAULT_DYE_PRESET = "yellow_green"
+
+
+# ---------------------------------------- lightweight IoU box tracker
+#
+# Keeps boxes from flickering frame to frame: a detection has to show up a
+# couple of times before it is reported, and once reported it survives a
+# few missed frames and gets exponentially smoothed instead of jumping.
+# Identical logic to UVScope's BoxTracker/_Track/_iou, renamed uv-prefixed
+# only to keep this section self-contained and collision-proof.
+class _UVTrack:
+    __slots__ = ("tid", "box", "area", "hits", "miss")
+
+    def __init__(self, tid: int, box: Tuple[float, float, float, float], area: float):
+        self.tid = tid
+        self.box = list(box)
+        self.area = float(area)
+        self.hits = 1
+        self.miss = 0
+
+
+def _uv_iou(a, b) -> float:
+    ax0, ay0, ax1, ay1 = a[0], a[1], a[0] + a[2], a[1] + a[3]
+    bx0, by0, bx1, by1 = b[0], b[1], b[0] + b[2], b[1] + b[3]
+    ix = max(0.0, min(ax1, bx1) - max(ax0, bx0))
+    iy = max(0.0, min(ay1, by1) - max(ay0, by0))
+    inter = ix * iy
+    if inter <= 0:
+        return 0.0
+    union = a[2] * a[3] + b[2] * b[3] - inter
+    return inter / union if union > 0 else 0.0
+
+
+class UVBoxTracker:
+    def __init__(self):
+        self.tracks: List[_UVTrack] = []
+        self._next_id = 1
+
+    def reset(self):
+        self.tracks.clear()
+        self._next_id = 1
+
+    def update(self, dets, min_hits: int, max_miss: int, alpha: float):
+        """dets: [[x, y, w, h, area], ...] -> confirmed, stable boxes."""
+        taken = set()
+        for tr in self.tracks:
+            best, best_iou = -1, 0.0
+            for j, d in enumerate(dets):
+                if j in taken:
+                    continue
+                v = _uv_iou(tr.box, d)
+                if v > best_iou:
+                    best, best_iou = j, v
+            if best >= 0 and best_iou >= 0.15:
+                taken.add(best)
+                d = dets[best]
+                for i in range(4):
+                    tr.box[i] = alpha * tr.box[i] + (1.0 - alpha) * d[i]
+                tr.area = alpha * tr.area + (1.0 - alpha) * d[4]
+                tr.hits += 1
+                tr.miss = 0
+            else:
+                tr.miss += 1
+
+        for j, d in enumerate(dets):
+            if j not in taken:
+                self.tracks.append(_UVTrack(self._next_id, d[:4], d[4]))
+                self._next_id += 1
+
+        self.tracks = [t for t in self.tracks if t.miss <= max_miss]
+        return [t for t in self.tracks if t.hits >= min_hits and t.miss == 0]
+
+
+# -------------------------------------------------------- main processor
+class UVProcessor:
+    """
+    proc = UVProcessor()
+    out, info = proc.process(frame_bgr, draw=False)
+
+    Two independent functions, same as UVScope:
+      filter  apply_filter()   simulates the yellow UV-blocking goggles: one
+                                LUT lookup, cheap enough to not matter.
+      detect + boost           finds fluorescence and enhances ONLY those
+                                pixels (everything else is an untouched copy
+                                of the original byte), then boxes them.
+
+    `draw=False` is the live-view path (§3.2/§3.9): every cv2 drawing call
+    -- boxes, labels, contours, HUD -- is skipped, but info['regions'] /
+    info['contours'] are still filled in FRAME coordinates so the caller
+    (the App) can draw them itself at display resolution, where the lines
+    come out crisp instead of upscaled from the analysis buffer.
+    """
+
+    def __init__(self, params: Optional[UVParams] = None):
+        self.params = params or UVParams()
+        self._lut: Optional[np.ndarray] = None
+        self._lut_dirty = True
+        self._tracker = UVBoxTracker()
+        self.last_info: Dict[str, Any] = {}
+
+    # ---------------------------------------------------------------- params
+    def set_params(self, params: UVParams) -> None:
+        self.params = params
+        self._lut_dirty = True
+
+    def update(self, **kw) -> None:
+        for k, v in kw.items():
+            setattr(self.params, k, v)
+        self._lut_dirty = True
+
+    def reset(self) -> None:
+        """Call on entering UV mode, any toggle/preset/param change touching
+        detection, a frame-size change, or a link-generation bump (§3.2) --
+        anything that makes the previous frame's boxes meaningless."""
+        self._tracker.reset()
+
+    # ---------------------------------------------- analysis-frame geometry
+    def _uv_analysis_shape(self, H: int, W: int) -> Tuple[float, int, int]:
+        """What _detect() would resize (H, W) down to, without doing the
+        actual cv2.resize -- shared by process() (which needs the analysis
+        short side even when detection is off, to report info['scale']) and
+        _detect() (which needs it to actually resize)."""
+        p = self.params
+        if p.analysis_width and W > p.analysis_width:
+            det_scale = p.analysis_width / float(W)
+            return (det_scale,
+                    max(1, int(round(H * det_scale))),
+                    max(1, int(round(W * det_scale))))
+        return 1.0, H, W
+
+    # ------------------------------------------------------------ filter
+    def _build_lut(self) -> Optional[np.ndarray]:
+        p = self.params
+        s = float(np.clip(p.filter_strength, 0.0, 1.0)) if p.filter_enabled else 0.0
+        gain_b = 1.0 - p.blue_cut * s
+        gain_g = 1.0 + p.warmth * 0.55 * s
+        gain_r = 1.0 + p.warmth * s
+
+        identity = (s == 0.0
+                    and abs(p.exposure - 1.0) < 1e-3
+                    and abs(p.gamma - 1.0) < 1e-3)
+        if identity:
+            return None
+
+        x = np.arange(256, dtype=np.float32) / 255.0
+        x = np.clip(x * float(p.exposure), 0.0, 1.0)
+        if abs(p.gamma - 1.0) > 1e-3:
+            x = np.power(x, 1.0 / max(0.05, float(p.gamma)))
+
+        lut = np.empty((1, 256, 3), dtype=np.uint8)
+        lut[0, :, 0] = np.clip(x * gain_b * 255.0, 0, 255)   # B
+        lut[0, :, 1] = np.clip(x * gain_g * 255.0, 0, 255)   # G
+        lut[0, :, 2] = np.clip(x * gain_r * 255.0, 0, 255)   # R
+        return lut
+
+    def apply_filter(self, frame: np.ndarray) -> np.ndarray:
+        """Apply the yellow-goggle filter alone: one LUT lookup."""
+        if self._lut_dirty:
+            self._lut = self._build_lut()
+            self._lut_dirty = False
+        if self._lut is None:
+            return frame
+        return cv2.LUT(frame, self._lut)
+
+    # ------------------------------------------------------ fluorescence detect
+    def _detect(self, frame: np.ndarray):
+        """Detect on the RAW frame (before the filter), so the filter's
+        tuning never affects what gets detected."""
+        p = self.params
+        H, W = frame.shape[:2]
+        det_scale, sh_t, sw_t = self._uv_analysis_shape(H, W)
+        small = cv2.resize(frame, (sw_t, sh_t), interpolation=cv2.INTER_AREA) \
+            if det_scale != 1.0 else frame
+
+        sh, sw = small.shape[:2]
+        s_analysis = min(sh, sw) / float(UV_REF_SHORT_SIDE)       # D8 pixel-param scale
+
+        sat_min, val_min, uv_min = p.effective_thresholds()
+        hsv = cv2.cvtColor(small, cv2.COLOR_BGR2HSV)
+        hmin, hmax = int(p.hue_min) % 180, int(p.hue_max) % 180
+
+        if hmin <= hmax:
+            mask = cv2.inRange(hsv, (hmin, sat_min, val_min), (hmax, 255, 255))
+        else:  # hue wraps past 0 (red/pink fluorescence)
+            m1 = cv2.inRange(hsv, (hmin, sat_min, val_min), (179, 255, 255))
+            m2 = cv2.inRange(hsv, (0, sat_min, val_min), (hmax, 255, 255))
+            mask = cv2.bitwise_or(m1, m2)
+
+        if p.uv_reject:
+            # The UV lamp's own spill is blue-dominant; fluorescence is
+            # green/red-dominant. This step rejects lamp spill specifically.
+            b, g, r = cv2.split(small)
+            dominance = cv2.subtract(cv2.max(g, r), b)
+            _, dm = cv2.threshold(dominance, uv_min, 255, cv2.THRESH_BINARY)
+            mask = cv2.bitwise_and(mask, dm)
+
+        eff_open_px = int(round(p.open_px * s_analysis))
+        if eff_open_px >= 3:
+            k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
+                                          (eff_open_px | 1, eff_open_px | 1))
+            mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, k)
+
+        blobs = mask
+        eff_merge_px = int(round(p.merge_px * s_analysis))
+        if eff_merge_px >= 3:
+            k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
+                                          (eff_merge_px | 1, eff_merge_px | 1))
+            blobs = cv2.dilate(mask, k)
+
+        num, labels, stats, _ = cv2.connectedComponentsWithStats(blobs, 8, cv2.CV_32S)
+        min_area = max(4, int(p.min_area_ratio * sh * sw))
+
+        dets: List[List[float]] = []
+        for i in range(1, num):
+            x, y, w, h, a = stats[i]
+            if a < min_area:
+                continue
+            real = int(cv2.countNonZero(mask[y:y + h, x:x + w]))
+            if real < max(3, min_area // 2):
+                continue
+            dets.append([float(x), float(y), float(w), float(h), float(real)])
+
+        dets.sort(key=lambda d: -d[4])
+        dets = dets[: max(1, int(p.max_regions))]
+        return mask, det_scale, dets
+
+    # ---------------------------------------------- boost (ROI-only pixels)
+    def _boost(self, base: np.ndarray, mask_s: np.ndarray, det_scale: float,
+               dets: List[List[float]], eff_feather_px: int) -> np.ndarray:
+        """Float math happens only inside each ROI; everything else in the
+        frame is an untouched copy, so cost scales with fluorescent area,
+        not with frame size -- important on the Pi."""
+        p = self.params
+        if not dets:
+            return base
+
+        H, W = base.shape[:2]
+        out = base.copy()
+        pad = max(2, int(eff_feather_px))
+        inv_scale = 1.0 / max(det_scale, 1e-6)
+
+        for d in dets:
+            x, y, w, h = d[0], d[1], d[2], d[3]
+            X0 = max(0, int(x * inv_scale) - pad)
+            Y0 = max(0, int(y * inv_scale) - pad)
+            X1 = min(W, int((x + w) * inv_scale) + pad)
+            Y1 = min(H, int((y + h) * inv_scale) + pad)
+            if X1 - X0 < 2 or Y1 - Y0 < 2:
+                continue
+
+            sx0 = max(0, int(X0 * det_scale))
+            sy0 = max(0, int(Y0 * det_scale))
+            sx1 = min(mask_s.shape[1], int(np.ceil(X1 * det_scale)))
+            sy1 = min(mask_s.shape[0], int(np.ceil(Y1 * det_scale)))
+            sub = mask_s[sy0:sy1, sx0:sx1]
+            if sub.size == 0:
+                continue
+
+            alpha = cv2.resize(sub, (X1 - X0, Y1 - Y0), interpolation=cv2.INTER_LINEAR)
+            if eff_feather_px >= 3:
+                k = eff_feather_px | 1
+                alpha = cv2.GaussianBlur(alpha, (k, k), 0)
+
+            roi_u8 = base[Y0:Y1, X0:X1]
+            roi = roi_u8.astype(np.float32)
+            gray = cv2.cvtColor(roi_u8, cv2.COLOR_BGR2GRAY).astype(np.float32)
+            g3 = cv2.merge([gray, gray, gray])
+
+            enh = g3 + (roi - g3) * float(p.boost_sat)      # saturation pull
+            enh *= float(p.boost_val)                        # brighten
+            enh[:, :, 0] *= (1.0 - float(p.boost_blue_cut))  # purify the colour
+            np.clip(enh, 0.0, 255.0, out=enh)
+
+            a = (alpha.astype(np.float32) * (1.0 / 255.0))[:, :, None]
+            out[Y0:Y1, X0:X1] = (roi * (1.0 - a) + enh * a).astype(np.uint8)
+
+        return out
+
+    # --------------------------------------------- region geometry + annotate
+    def _regions_from_boxes(self, boxes, det_scale: float, frame_area_small: float,
+                            H: int, W: int) -> List[Dict[str, Any]]:
+        """Box geometry + area%, in FRAME coordinates -- no cv2 drawing.
+        Shared by the draw=True (_annotate) and draw=False paths so both
+        report exactly the same regions (§3.9 contract)."""
+        inv = 1.0 / max(det_scale, 1e-6)
+        regions: List[Dict[str, Any]] = []
+        for tr in boxes:
+            if isinstance(tr, _UVTrack):
+                bx, tid, ar = tr.box, tr.tid, tr.area
+            else:
+                bx, tid, ar = tr[:4], 0, tr[4]
+
+            X0 = int(max(0, bx[0] * inv))
+            Y0 = int(max(0, bx[1] * inv))
+            X1 = int(min(W - 1, (bx[0] + bx[2]) * inv))
+            Y1 = int(min(H - 1, (bx[1] + bx[3]) * inv))
+            pct = 100.0 * ar / max(1.0, frame_area_small)
+            regions.append({"id": tid, "box": (X0, Y0, X1 - X0, Y1 - Y0), "percent": pct})
+        return regions
+
+    def _annotate(self, out: np.ndarray, boxes, det_scale: float,
+                  frame_area_small: float, eff_box_thickness: int) -> List[Dict[str, Any]]:
+        p = self.params
+        H, W = out.shape[:2]
+        regions = self._regions_from_boxes(boxes, det_scale, frame_area_small, H, W)
+        if not p.draw_boxes:
+            return regions
+
+        color = tuple(int(c) for c in p.box_bgr)
+        th = max(1, int(eff_box_thickness))
+        fs = max(0.34, W / 1700.0)
+
+        for region in regions:
+            X0, Y0, w_, h_ = region["box"]
+            X1, Y1 = X0 + w_, Y0 + h_
+            tid, pct = region["id"], region["percent"]
+            cv2.rectangle(out, (X0, Y0), (X1, Y1), color, th, cv2.LINE_AA)
+
+            if p.show_labels:
+                text = "#%d %.2f%%" % (tid, pct) if tid else "%.2f%%" % pct
+                (tw, tht), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, fs, 1)
+                ly = Y0 - 4 if Y0 - tht - 6 >= 0 else Y1 + tht + 6
+                lx = min(X0, W - tw - 6)
+                cv2.rectangle(out, (lx, ly - tht - 4), (lx + tw + 6, ly + 3), color, -1)
+                cv2.putText(out, text, (lx + 3, ly), cv2.FONT_HERSHEY_SIMPLEX,
+                            fs, (0, 0, 0), 1, cv2.LINE_AA)
+
+        return regions
+
+    def _hud(self, out: np.ndarray, n: int, coverage: float, ms: float) -> None:
+        W = out.shape[1]
+        fs = max(0.36, W / 1900.0)
+        text = "REGIONS %d   COVER %.2f%%   %.0f ms" % (n, coverage, ms)
+        (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, fs, 1)
+        cv2.rectangle(out, (8, 8), (8 + tw + 14, 8 + th + 14), (24, 18, 12), -1)
+        cv2.putText(out, text, (15, 8 + th + 5), cv2.FONT_HERSHEY_SIMPLEX,
+                    fs, (120, 235, 255), 1, cv2.LINE_AA)
+
+    # -------------------------------------------------------------- main entry
+    def process(self, frame: Optional[np.ndarray], draw: bool = True
+                ) -> Tuple[np.ndarray, Dict[str, Any]]:
+        """BGR frame -> (processed BGR frame, info dict).
+
+        draw=True reproduces UVScope's own process() exactly (bit-for-bit
+        at scale 1 -- see test_uv_core.py). draw=False is the live endoscope
+        path: every cv2 drawing call is skipped, but info['regions'] /
+        info['contours'] are still filled in FRAME coordinates, and the
+        frame itself still gets the filter and the ROI boost -- only the
+        box/label/contour/HUD *pixels* are left for the caller to draw.
+        """
+        t0 = time.perf_counter()
+        if (frame is None or not hasattr(frame, "shape") or frame.size == 0
+                or frame.ndim != 3 or frame.shape[2] != 3 or frame.dtype != np.uint8):
+            # Garbage in (no signal, odd capture format, a bad decode) must
+            # never crash the Tk loop (§3.1) -- hand the frame straight back.
+            return frame, {}
+
+        p = self.params
+        H, W = frame.shape[:2]
+        s_full = min(H, W) / float(UV_REF_SHORT_SIDE)           # feather/box-thickness scale
+        _, ash, asw = self._uv_analysis_shape(H, W)
+        s_analysis = min(ash, asw) / float(UV_REF_SHORT_SIDE)   # open/merge scale; == info['scale']
+
+        out = self.apply_filter(frame)
+        if out is frame:
+            out = frame.copy()
+
+        info: Dict[str, Any] = {"regions": [], "coverage": 0.0, "count": 0, "scale": s_analysis}
+
+        if p.detect_enabled:
+            mask_s, det_scale, dets = self._detect(frame)
+            area_small = float(mask_s.shape[0] * mask_s.shape[1])
+            info["coverage"] = 100.0 * float(cv2.countNonZero(mask_s)) / max(1.0, area_small)
+
+            eff_feather_px = int(round(p.feather_px * s_full))
+            if p.boost_enabled:
+                out = self._boost(out, mask_s, det_scale, dets, eff_feather_px)
+
+            if p.track_enabled:
+                boxes = self._tracker.update(dets, int(p.track_min_hits),
+                                             int(p.track_max_miss), float(p.track_alpha))
+            else:
+                boxes = dets
+
+            if p.draw_contours:
+                cnts, _ = cv2.findContours(mask_s, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                inv = 1.0 / max(det_scale, 1e-6)
+                cnts = [np.round(c.astype(np.float32) * inv).astype(np.int32) for c in cnts]
+                info["contours"] = cnts
+                if draw and p.draw_boxes:
+                    cv2.drawContours(out, cnts, -1, tuple(int(c) for c in p.box_bgr),
+                                     1, cv2.LINE_AA)
+
+            eff_box_thickness = int(round(p.box_thickness * s_full))
+            if draw:
+                info["regions"] = self._annotate(out, boxes, det_scale, area_small,
+                                                  eff_box_thickness)
+            else:
+                info["regions"] = self._regions_from_boxes(boxes, det_scale, area_small, H, W)
+            info["count"] = len(info["regions"])
+
+        ms = (time.perf_counter() - t0) * 1000.0
+        info["ms"] = ms
+        if draw and p.show_hud:
+            self._hud(out, info["count"], info["coverage"], ms)
+
+        self.last_info = info
+        return out, info
 
 
 # ------------------------------------------------------------- application
