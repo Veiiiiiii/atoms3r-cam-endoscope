@@ -18,6 +18,7 @@ import importlib.util
 import io
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -59,6 +60,12 @@ def load_module(path, name):
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     module.CONFIG = str(TMP / (name + ".json"))
+    # The tuning drawer's presets file and EXPORT never touch the real home
+    # folder or a real USB stick either (6.1.0 has neither, hence getattr).
+    if hasattr(module, "UV_PRESETS_FILE"):
+        module.UV_PRESETS_FILE = str(TMP / (name + "_uv_presets.json"))
+        module.UV_MEDIA_ROOT = str(TMP / "no_media")
+        module.uv_find_export_dir = lambda **kw: (str(TMP / (name + "_export")), False)
     return module
 
 
@@ -146,11 +153,14 @@ def make_args():
         imu_ws="ws://192.168.4.1/api/v1/ws/imu_data")
 
 
-def make_app(mod, frame, cfg=None):
+def make_app(mod, frame, cfg=None, keep_presets=False):
     if cfg is not None:
         Path(mod.CONFIG).write_text(json.dumps(cfg), encoding="utf-8")
     elif os.path.exists(mod.CONFIG):
         os.remove(mod.CONFIG)
+    presets = getattr(mod, "UV_PRESETS_FILE", None)
+    if presets and not keep_presets and os.path.exists(presets):
+        os.remove(presets)
     spy = ImageSpy()
     mod.Image = spy
     link = StaticLink(frame)
@@ -297,19 +307,7 @@ def test_toggles_persist(mod):
             expect[name] = not expect[name]
             app.uv_toggle(name)
             assert app.uv_opts == expect
-            saved = json.loads(Path(mod.CONFIG).read_text(encoding="utf-8"))
-            assert saved["uv"] == expect, saved.get("uv")
-            assert saved["uv_tuning_panel"] is True
-            p = app.uv_proc.params
-            assert p.boost_enabled == expect["boost"]
-            assert p.draw_boxes == expect["boxes"]
-            assert p.filter_enabled == expect["filter"]
-            assert p.detect_enabled == (expect["boost"] or expect["boxes"])
-            labels = {b[0]: app.canvas.itemcget(b[5], "text") for b in app.uv_bar}
-            for n in ("boost", "boxes", "filter"):
-                assert labels[n].startswith("✓ ") == expect[n], labels
-        # Here: boost False, boxes False, filter False -> nothing detects.
-        assert app.uv_proc.params.detect_enabled is False
+            assert app._video_rect()[2] == app.W
         app.uv_toggle("nonsense")                     # ignored, no crash
         assert app.uv_opts == expect
         final = dict(app.uv_opts)
@@ -620,6 +618,446 @@ def test_perf_guard(mod):
           "kept across toggles")
 
 
+# ------------------------------------------- tuning drawer (item 5, §3.6/§3.7)
+def tab_tap(app):
+    """Tap the arrow tab the way a finger does: a Button-1 on the main canvas."""
+    x0, y0, x1, y1 = app.uv_tab
+    app.canvas.event_generate("<Button-1>", x=int((x0 + x1) / 2), y=int((y0 + y1) / 2))
+    app.root.update()
+
+
+def press(widget, x, y):
+    widget.event_generate("<ButtonPress-1>", x=x, y=y)
+
+
+def drag(widget, x, y):
+    widget.event_generate("<B1-Motion>", x=x, y=y)
+
+
+def release(widget, x, y):
+    widget.event_generate("<ButtonRelease-1>", x=x, y=y)
+
+
+def tap(widget, x, y):
+    press(widget, x, y)
+    release(widget, x, y)
+
+
+def body_point(app, kind, key, fx=0.5):
+    """Widget coordinates of a body target, scrolling it into view first."""
+    x0, y0, x1, y1 = next(h[:4] for h in app._uv_hits if h[4] == kind and h[5] == key)
+    if y0 - app._uv_moved < 0 or y1 - app._uv_moved > app._uv_body_h:
+        app._uv_scroll_to(y0 - 10)
+    return int(x0 + (x1 - x0) * fx), int((y0 + y1) / 2 - app._uv_moved)
+
+
+def head_tap(app, key):
+    _, x0, y0, x1, y1 = next(h for h in app._uv_hhits if h[0] == key)
+    tap(app.uv_dh, int((x0 + x1) / 2), int((y0 + y1) / 2))
+    app.root.update()
+
+
+def head_name(app):
+    return app.uv_dh.itemcget(app._uv_name_item, "text")
+
+
+def test_drawer_hidden_by_default(mod):
+    app, link, spy = make_app(mod, scene())
+    try:
+        tick(app, link)
+        assert app.uv_drawer is None and not app.canvas.find_withtag("uv_tab")   # UV off
+        app.toggle_uv_mode()
+        tick(app, link)
+        assert app.uv_drawer_open is False and app.uv_drawer is None
+        assert app.canvas.find_withtag("uv_tab"), "no arrow tab in UV mode"
+        assert app._video_rect() == (app.W // 2, app.H // 2, app.W, app.H)
+        # The tab sits on the right edge between the indicator panel and ZERO,
+        # clear of the option bar.
+        x0, y0, x1, y1 = app.uv_tab
+        assert x1 == app.W and x0 < x1 and y1 < app.uv_bar_box[1]
+        zero = app.canvas.bbox(text_item(app, "ZERO"))
+        assert y1 < zero[1] and y0 > int(min(app.W, app.H) * 0.33)
+        assert y1 - y0 >= 0.13 * app.H and x1 - x0 >= 0.066 * app.H     # finger sized
+    finally:
+        close(app)
+    rev = mod.CONFIG_REV
+    app, link, spy = make_app(mod, scene(), cfg={"config_rev": rev, "uv_tuning_panel": False})
+    try:
+        app.toggle_uv_mode()
+        tick(app, link)
+        assert not app.canvas.find_withtag("uv_tab")
+        app.toggle_uv_drawer()
+        assert app.uv_drawer_open is False and app.uv_drawer is None
+        saved = json.loads(Path(mod.CONFIG).read_text(encoding="utf-8")) \
+            if os.path.exists(mod.CONFIG) else {}
+        assert saved.get("uv_tuning_panel", False) is False
+    finally:
+        close(app)
+    print("PASS: DRAWER HIDDEN -- no tab in normal mode, closed tab between indicator and ZERO "
+          "in UV mode, nothing at all when uv_tuning_panel is false")
+
+
+def test_drawer_open_close(mod):
+    app, link, spy = make_app(mod, scene())
+    try:
+        for geometry in ((1024, 600), (800, 480)):
+            resize_to(app, *geometry)
+            if not app.uv_mode:
+                app.toggle_uv_mode()
+            tick(app, link)
+            opts = dict(app.uv_opts)
+            W, H = app.W, app.H
+            tab_tap(app)
+            assert app.uv_drawer_open and app.uv_drawer is not None, geometry
+            assert app.uv_opts == opts, "a tab tap also hit the option bar"
+            tab_w, panel_w = app._uv_drawer_dims()
+            assert panel_w >= 300 and W - panel_w - tab_w >= 0.45 * W - 1
+            app.root.update()
+            assert app.uv_drawer.winfo_x() == W - panel_w
+            assert app.uv_drawer.winfo_width() == panel_w and app.uv_drawer.winfo_height() == H
+            cx, cy, aw, ah = app._video_rect()
+            assert (cx, cy, aw, ah) == ((W - panel_w - tab_w) // 2, H // 2, W - panel_w - tab_w, H)
+            # The whole picture is displayed left of the drawer and its tab.
+            tick(app, link)
+            img = spy.arrays[-1]
+            vx, vy = app.canvas.coords(app.video_item)
+            left, right = vx - img.shape[1] // 2, vx - img.shape[1] // 2 + img.shape[1]
+            assert (vx, vy) == (cx, cy) and left >= 0 and right <= aw, (left, right, aw)
+            assert img.shape[1] == aw or img.shape[0] == H     # still fitted, not cropped
+            # The tab moved to the drawer's left edge, pointing right.
+            x0, y0, x1, y1 = app.uv_tab
+            assert x1 == W - panel_w and x0 >= aw
+            assert "\u25b6" in [app.canvas.itemcget(i, "text") for i in app.canvas.find_withtag("uv_tab")
+                                if app.canvas.type(i) == "text"]
+            # The bar is re-centred on the picture and stays left of the drawer.
+            bx0, by0, bx1, by1 = app.uv_bar_box
+            assert abs((bx0 + bx1) / 2.0 - cx) <= 1.0 and bx0 >= 0 and bx1 < x0
+            # Close again: everything back where UV mode had it.
+            tab_tap(app)
+            assert not app.uv_drawer_open and app.uv_drawer is None
+            assert app._video_rect() == (W // 2, H // 2, W, H)
+            assert abs((app.uv_bar_box[0] + app.uv_bar_box[2]) / 2.0 - W // 2) <= 1.0
+            assert app.uv_tab[2] == W and app.uv_opts == opts
+    finally:
+        close(app)
+    print("PASS: DRAWER OPEN/CLOSE -- tab toggles it (without hitting the bar), picture refitted "
+          "and wholly visible left of the drawer, bar re-centred, tab moves, at 1024x600 and 800x480")
+
+
+def test_drawer_edits(mod):
+    app, link, spy = make_app(mod, blob_frame())
+    try:
+        app.toggle_uv_mode()
+        tick(app, link)
+        tab_tap(app)
+        resets = []
+        real = app.uv_proc.reset
+        app.uv_proc.reset = lambda: (resets.append(1), real())
+        assert head_name(app) == "FACTORY"
+        body = app.uv_db
+        # + / - taps: one slider notch each, applied live, "*" marker.
+        x, y = body_point(app, "plus", "exposure")
+        tap(body, x, y)
+        assert abs(app.uv_work.exposure - 1.17) < 1e-9, app.uv_work.exposure
+        assert abs(app.uv_proc.params.exposure - 1.17) < 1e-9
+        assert head_name(app) == "FACTORY *" and app.last_seq == -1
+        assert body.itemcget(app._uv_rows["exposure"]["value"], "text") == "1.17"
+        x, y = body_point(app, "minus", "exposure")
+        tap(body, x, y)
+        tap(body, x, y)
+        assert abs(app.uv_work.exposure - 1.15) < 1e-9
+        x, y = body_point(app, "plus", "exposure")
+        tap(body, x, y)
+        assert app.uv_work.exposure == 1.16 and head_name(app) == "FACTORY"   # back to clean
+        x, y = body_point(app, "plus", "hue_min")
+        tap(body, x, y)
+        assert app.uv_work.hue_min == 43 and isinstance(app.uv_work.hue_min, int)
+        x, y = body_point(app, "plus", "min_area_ratio")
+        tap(body, x, y)
+        assert abs(app.uv_work.min_area_ratio - 0.00200) < 1e-12
+        assert body.itemcget(app._uv_rows["min_area_ratio"]["value"], "text") == "0.200"
+        # A tap on the track jumps there; the ends are the UVScope range.
+        tx0, tx1 = app._uv_rows["merge_px"]["tx"]
+        _, y = body_point(app, "track", "merge_px")
+        tap(body, tx1 + 5, y)
+        assert app.uv_work.merge_px == 41
+        # A sideways drag that starts on the track drags the value and keeps
+        # dragging it whatever the finger does next.
+        scroll0 = app._uv_scroll
+        press(body, tx1 - 2, y)
+        drag(body, tx1 - 40, y + 2)
+        assert app.uv_work.merge_px < 41
+        drag(body, tx0 - 5, y + 30)
+        assert app.uv_work.merge_px == 0 and app._uv_scroll == scroll0
+        drag(body, (tx0 + tx1) // 2, y)
+        assert abs(app.uv_work.merge_px - 20) <= 1
+        release(body, (tx0 + tx1) // 2, y)
+        assert app.uv_proc.params.merge_px == app.uv_work.merge_px
+        # One that starts on the track but goes up/down first is a scroll.
+        mid = app.uv_work.merge_px
+        _, y = body_point(app, "track", "merge_px")
+        scroll0 = app._uv_scroll
+        press(body, tx0 + 3, y)
+        drag(body, tx0 + 6, y - 40)
+        release(body, tx0 + 6, y - 40)
+        assert app.uv_work.merge_px == mid and app._uv_scroll == scroll0 + 40
+        # Toggle and cycle rows.
+        x, y = body_point(app, "toggle", "show_labels")
+        tap(body, x, y)
+        assert app.uv_work.show_labels is True and app.uv_proc.params.show_labels is True
+        x, y = body_point(app, "cycle", "box_bgr")
+        tap(body, x, y)
+        assert tuple(app.uv_work.box_bgr) == (0, 255, 0)
+        x, y = body_point(app, "cycle", "dye")
+        tap(body, x, y)
+        for k, v in mod.UV_DYE_PRESETS["yellow_green"]["params"].items():
+            assert getattr(app.uv_work, k) == v, k
+        tap(body, *body_point(app, "cycle", "dye"))
+        assert app.uv_work.hue_min == mod.UV_DYE_PRESETS["green"]["params"]["hue_min"]
+        assert resets == [], "a drawer edit reset the tracker"
+        # Bar toggles still own the four enable switches.
+        assert app.uv_proc.params.boost_enabled == app.uv_opts["boost"]
+        # Edits really reach the picture: green boxes now.
+        for _ in range(3):
+            tick(app, link)
+        assert (spy.arrays[-1] == [0, 255, 0]).all(axis=-1).sum() > 50
+        assert app.uv_dh.itemcget(app._uv_ms_item, "text").endswith("ms")
+    finally:
+        close(app)
+    print("PASS: DRAWER EDITS -- -/+ step one notch (ints 1, 2-dec 0.01, min region 0.001%), "
+          "track drag sets the value, toggles and cycles, live apply without tracker resets, "
+          "'*' marker comes and goes")
+
+
+def test_drawer_scroll(mod):
+    app, link, spy = make_app(mod, scene())
+    try:
+        resize_to(app, 800, 480)
+        app.toggle_uv_mode()
+        tab_tap(app)
+        body = app.uv_db
+        assert app._uv_content_h > app._uv_body_h * 2
+        before = app.uv_work.to_dict()
+        # A finger drag that starts on a label (no target) scrolls.
+        y = app._uv_body_h - 20
+        press(body, 30, y)
+        drag(body, 30, y - 4)                 # inside the slop: nothing yet
+        assert app._uv_scroll == 0
+        drag(body, 30, y - 150)
+        assert app._uv_scroll == 150, app._uv_scroll
+        release(body, 30, y - 150)
+        # A drag that starts on a +/- button scrolls too and never presses it.
+        x, yb = body_point(app, "plus", "sat_min")
+        s0 = app._uv_scroll
+        press(body, x, yb)
+        drag(body, x, yb - 60)
+        release(body, x, yb - 60)
+        assert app._uv_scroll == s0 + 60
+        assert app.uv_work.to_dict() == before, "scrolling changed a value"
+        # Clamped at both ends.
+        press(body, 30, 100)
+        drag(body, 30, 100 + 10000)
+        release(body, 30, 100 + 10000)
+        assert app._uv_scroll == 0
+        press(body, 30, 300)
+        drag(body, 30, 300 - 10000)
+        release(body, 30, 300 - 10000)
+        assert app._uv_scroll == app._uv_content_h - app._uv_body_h
+        # Mouse wheel (development only).
+        body.event_generate("<MouseWheel>", delta=120, x=30, y=100)
+        assert app._uv_scroll < app._uv_content_h - app._uv_body_h
+        s1 = app._uv_scroll
+        body.event_generate("<Button-5>", x=30, y=100)
+        assert app._uv_scroll > s1
+        assert app.uv_work.to_dict() == before
+        # Relayout keeps the drawer open and the scroll position (clamped).
+        app._uv_scroll_to(200)
+        resize_to(app, 1024, 600)
+        assert app.uv_drawer_open and app.uv_drawer is not None
+        app.root.update()
+        assert app.uv_drawer.winfo_width() == app._uv_drawer_dims()[1]
+        assert app._uv_scroll == min(200, app._uv_content_h - app._uv_body_h)
+        # A stage change destroys it; coming back to RUN rebuilds it.
+        app.set_stage(app.STAGE_SETUP)
+        assert app.uv_drawer is None and app._video_rect()[2] == app.W
+        app.set_stage(app.STAGE_RUN)
+        assert app.uv_drawer is not None
+        # Leaving UV mode closes it for good.
+        app.toggle_uv_mode()
+        assert app.uv_drawer is None and not app.uv_drawer_open
+        assert not app.canvas.find_withtag("uv_tab")
+        app.toggle_uv_mode()
+        assert app.uv_drawer is None and not app.uv_drawer_open
+    finally:
+        close(app)
+    print("PASS: DRAWER SCROLL -- finger drag scrolls (8 px slop, clamped), never changes a "
+          "value; wheel scrolls; relayout keeps it; stage change / UV exit close it")
+
+
+def test_presets(mod):
+    app, link, spy = make_app(mod, scene())
+    path = Path(mod.UV_PRESETS_FILE)
+    try:
+        app.toggle_uv_mode()
+        tab_tap(app)
+        body = app.uv_db
+        tap(body, *body_point(app, "plus", "exposure"))
+        assert head_name(app) == "FACTORY *"
+        head_tap(app, "save")
+        data = json.loads(path.read_text(encoding="utf-8"))
+        assert len(data["presets"]) == 1 and data["active"] == data["presets"][0]["id"]
+        first = data["presets"][0]
+        assert re.fullmatch(r"\d\d:\d\d \d\d-\d\d", first["name"]), first["name"]
+        assert abs(first["params"]["exposure"] - 1.17) < 1e-9
+        assert app.uv_active_id == first["id"] and head_name(app) == first["name"]
+        toast = [app.canvas.itemcget(i, "text") for i in app.toast_items
+                 if app.canvas.type(i) == "text"]
+        assert toast == ["SAVED " + first["name"]], toast
+        # The toast is centred on the picture, not under the drawer.
+        tx = app.canvas.coords(app.toast_items[1])[0]
+        assert abs(tx - app._video_rect()[0]) <= 1
+        # A second SAVE is always a NEW preset, listed first.
+        tap(body, *body_point(app, "plus", "gamma"))
+        head_tap(app, "save")
+        data = json.loads(path.read_text(encoding="utf-8"))
+        assert len(data["presets"]) == 2
+        second = data["presets"][0]
+        assert second["id"] != first["id"] and data["active"] == second["id"]
+        if second["name"][:11] == first["name"]:
+            assert second["name"] == first["name"] + " (2)"
+        # Preset list: FACTORY first, then newest first; tap one to load it.
+        head_tap(app, "list")
+        assert app._uv_list_open
+        ids = [h[5] for h in app._uv_hits if h[4] == "preset"]
+        assert ids == ["factory", second["id"], first["id"]], ids
+        resets = []
+        real = app.uv_proc.reset
+        app.uv_proc.reset = lambda: (resets.append(1), real())
+        tap(body, *body_point(app, "preset", "factory"))
+        assert not app._uv_list_open and app.uv_active_id == "factory"
+        assert app.uv_work == mod.UVParams() and head_name(app) == "FACTORY"
+        assert resets, "a preset switch must restart the tracker"
+        assert json.loads(path.read_text(encoding="utf-8"))["active"] == "factory"
+        # Unsaved edits are dropped by a switch.
+        tap(body, *body_point(app, "plus", "warmth"))
+        assert head_name(app) == "FACTORY *"
+        head_tap(app, "list")
+        tap(body, *body_point(app, "preset", first["id"]))
+        assert app.uv_active_id == first["id"]
+        assert app.uv_work == mod.UVParams.from_dict(first["params"])
+        assert abs(app.uv_work.warmth - 0.15) < 1e-9
+        tap(body, *body_point(app, "plus", "warmth"))        # unsaved again ...
+    finally:
+        close(app)
+
+    # ... and a restart forgets them, but keeps the active preset.
+    app, link, spy = make_app(mod, scene(), keep_presets=True)
+    try:
+        assert app.uv_active_id == first["id"]
+        assert app.uv_work == mod.UVParams.from_dict(first["params"])
+        assert abs(app.uv_proc.params.exposure - 1.17) < 1e-9
+        assert [p["id"] for p in app.uv_presets["presets"]] == [second["id"], first["id"]]
+        app.toggle_uv_mode()
+        tab_tap(app)
+        # DELETE: one tap arms it, a second within 3 s deletes.
+        rect, text = app._uv_hbtn["delete"]
+        head_tap(app, "delete")
+        assert app.uv_dh.itemcget(text, "text") == "CONFIRM?"
+        assert app.uv_dh.itemcget(rect, "fill") == "#c62828"
+        assert len(app.uv_presets["presets"]) == 2
+        app._uv_del_until = time.monotonic() - 0.01           # 3 s went by
+        head_tap(app, "delete")                                # re-arms only
+        assert len(app.uv_presets["presets"]) == 2
+        assert app.uv_dh.itemcget(text, "text") == "CONFIRM?"
+        head_tap(app, "delete")
+        assert [p["id"] for p in app.uv_presets["presets"]] == [second["id"]]
+        assert app.uv_active_id == second["id"]                 # newest remaining
+        assert app.uv_dh.itemcget(text, "text") == "DELETE"
+        data = json.loads(path.read_text(encoding="utf-8"))
+        assert [p["id"] for p in data["presets"]] == [second["id"]]
+        assert data["active"] == second["id"]
+        head_tap(app, "delete")
+        head_tap(app, "delete")
+        assert app.uv_presets["presets"] == [] and app.uv_active_id == "factory"
+        # FACTORY cannot be deleted: greyed, and taps do nothing.
+        assert app.uv_dh.itemcget(text, "fill") == mod.MUTED
+        head_tap(app, "delete")
+        head_tap(app, "delete")
+        assert app.uv_active_id == "factory"
+        assert json.loads(path.read_text(encoding="utf-8")) == {
+            "version": 1, "active": "factory", "presets": []}
+        # EXPORT: FACTORY + bundle into the (redirected) export folder.
+        export = Path(mod.uv_find_export_dir()[0])
+        head_tap(app, "save")
+        head_tap(app, "export")
+        files = sorted(p.name for p in export.iterdir())
+        assert len([f for f in files if f.startswith("uv_params_")]) >= 2, files
+        assert any(f.endswith("_FACTORY.json") for f in files)
+        assert any(f.startswith("uv_presets_all_") for f in files)
+        toast = [app.canvas.itemcget(i, "text") for i in app.toast_items
+                 if app.canvas.type(i) == "text"]
+        assert toast and toast[0].startswith("EXPORTED 3 FILES"), toast
+        # A failing export is a toast, never an exception into Tk.
+        real_export = mod.uv_export
+        mod.uv_export = lambda *a, **k: (_ for _ in ()).throw(OSError("disk full"))
+        try:
+            with contextlib.redirect_stderr(io.StringIO()):
+                head_tap(app, "export")
+        finally:
+            mod.uv_export = real_export
+        toast = [app.canvas.itemcget(i, "text") for i in app.toast_items
+                 if app.canvas.type(i) == "text"]
+        assert toast == ["EXPORT FAILED"], toast
+    finally:
+        close(app)
+
+    # A corrupt presets file is FACTORY, not a crash.
+    path.write_text("{ not json", encoding="utf-8")
+    app, link, spy = make_app(mod, scene(), keep_presets=True)
+    try:
+        assert app.uv_active_id == "factory" and app.uv_work == mod.UVParams()
+        app.toggle_uv_mode()
+        tab_tap(app)
+        assert head_name(app) == "FACTORY"
+    finally:
+        close(app)
+    print("PASS: PRESETS -- SAVE makes a new active preset (atomic file, toast on the picture), "
+          "list FACTORY + newest first, switch drops edits and resets tracker, restart keeps "
+          "the active preset, DELETE needs two taps in 3 s, FACTORY undeletable, EXPORT writes "
+          "files / fails as a toast, corrupt file -> FACTORY")
+
+
+def test_diag_hides_bar(mod):
+    """Legacy DIAG grid: bar labels (and their plain backgrounds) hidden and
+    the bar not tappable while it is up; back as soon as it is gone."""
+    app, link, spy = make_app(mod, scene())
+    try:
+        app.toggle_uv_mode()
+        tick(app, link)
+        app.diag_photo = scene(240, 320, seed=1)
+        tick(app, link)
+        for b in app.uv_bar:
+            assert app.canvas.itemcget(b[5], "state") == "hidden"
+        for r in app.uv_bar_bg:
+            assert app.canvas.itemcget(r, "state") == "hidden"
+        b = next(b for b in app.uv_bar if b[0] == "boost")
+        before = dict(app.uv_opts)
+        app.canvas.event_generate("<Button-1>", x=(b[1] + b[3]) // 2, y=(b[2] + b[4]) // 2)
+        app.root.update()
+        assert app.uv_opts == before
+        app.diag_photo = None
+        tick(app, link)
+        for b in app.uv_bar:
+            assert app.canvas.itemcget(b[5], "state") == "normal"
+        b = next(b for b in app.uv_bar if b[0] == "boost")
+        app.canvas.event_generate("<Button-1>", x=(b[1] + b[3]) // 2, y=(b[2] + b[4]) // 2)
+        app.root.update()
+        assert app.uv_opts["boost"] != before["boost"]
+    finally:
+        close(app)
+    print("PASS: DIAG -- bar hidden and inert under the DIAG grid, restored after")
+
+
 def main():
     import tkinter as tk
     try:
@@ -639,6 +1077,12 @@ def main():
     test_tracker_resets(new)
     test_blob_pixels(new)
     test_perf_guard(new)
+    test_drawer_hidden_by_default(new)
+    test_drawer_open_close(new)
+    test_drawer_edits(new)
+    test_drawer_scroll(new)
+    test_presets(new)
+    test_diag_hides_bar(new)
     print("DONE: test_uv_ui.py")
 
 

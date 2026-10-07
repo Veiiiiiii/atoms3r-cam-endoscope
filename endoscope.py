@@ -3476,6 +3476,264 @@ class UVProcessor:
         return out, info
 
 
+# ------------------------------------------- tuning presets and export
+#
+# The engineer's tuning drawer (D10-D12, UV-PORT-PLAN.md §3.6/§3.7) keeps
+# its saved presets in their own small file next to endoscope.json, so a
+# damaged preset file can never take the main config (zero, axis, flips)
+# down with it, and vice versa. FACTORY is never written there: it lives in
+# the code (UV_FACTORY) so no file edit or failed write can change it.
+# Everything below is plain Python with no Tk, so test_uv_presets.py can
+# exercise it directly; none of it raises except uv_export, whose caller
+# turns a failure into a toast.
+
+UV_PRESETS_FILE = os.path.join(os.path.expanduser("~"), ".config",
+                               "endoscope_uv_presets.json")
+UV_EXPORT_DIRNAME = "Endoscope_UV_presets"
+UV_MEDIA_ROOT = "/media"        # where Raspberry Pi OS automounts USB sticks
+UV_FACTORY_ID = "factory"
+UV_FACTORY_NAME = "FACTORY"
+UV_EXPORTED_BY = "Endoscope 6.2.0"
+
+
+def _uv_localtime(now=None):
+    """struct_time for an epoch number, a datetime, or None (= now)."""
+    if now is None:
+        return time.localtime()
+    if hasattr(now, "timetuple"):
+        return now.timetuple()
+    return time.localtime(float(now))
+
+
+def _uv_params_json(p):
+    """UVParams -> a plain JSON-ready dict (box_bgr as a list)."""
+    d = p.to_dict()
+    d["box_bgr"] = [int(c) for c in d["box_bgr"]]
+    return d
+
+
+def uv_presets_load(path):
+    """Read the presets file into {"version", "active", "presets"}. Never
+    raises: a missing, unreadable or hand-mangled file just means "no saved
+    presets, FACTORY active", and a bad entry is dropped on its own instead
+    of taking the good ones with it. Saved presets come back newest first,
+    their params already cleaned by UVParams.from_dict (so a NaN or an
+    out-of-range value in the file is factory/clamped from here on)."""
+    data = {"version": 1, "active": UV_FACTORY_ID, "presets": []}
+    try:
+        with open(path, encoding="utf-8") as f:
+            raw = json.load(f)
+    except Exception:
+        return data
+    if not isinstance(raw, dict):
+        return data
+    entries = raw.get("presets")
+    seen = set()
+    for e in entries if isinstance(entries, list) else []:
+        if not isinstance(e, dict):
+            continue
+        pid, name, params = e.get("id"), e.get("name"), e.get("params")
+        if (not isinstance(pid, str) or not pid.strip() or pid == UV_FACTORY_ID
+                or pid in seen or not isinstance(name, str) or not name.strip()
+                or not isinstance(params, dict)):
+            continue
+        created = e.get("created")
+        seen.add(pid)
+        data["presets"].append({
+            "id": pid, "name": name.strip()[:40],
+            "created": created if isinstance(created, str) else "",
+            "params": _uv_params_json(UVParams.from_dict(params))})
+    # ISO timestamps sort as text; sorted() is stable for equal/blank ones.
+    data["presets"].sort(key=lambda p: p["created"], reverse=True)
+    if raw.get("active") in seen:
+        data["active"] = raw["active"]
+    return data
+
+
+def _uv_write_json(path, obj):
+    """Write JSON so that a power cut leaves either the old file or the new
+    one, never half of each: write a temp file in the same directory, push
+    it to the disk, then rename it over the target in one step."""
+    folder = os.path.dirname(os.path.abspath(path))
+    os.makedirs(folder, exist_ok=True)
+    tmp = "{}.{}.tmp".format(path, os.getpid())
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(obj, f, indent=1, allow_nan=False)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def uv_presets_save(path, data):
+    """Atomically write the user presets (FACTORY is never stored).
+    Returns True on success, False on any failure; never raises."""
+    try:
+        presets = [{"id": str(p["id"]), "name": str(p["name"]),
+                    "created": str(p.get("created", "")),
+                    "params": _uv_params_json(UVParams.from_dict(p["params"]))}
+                   for p in data.get("presets", []) if p.get("id") != UV_FACTORY_ID]
+        active = data.get("active", UV_FACTORY_ID)
+        if active not in {p["id"] for p in presets}:
+            active = UV_FACTORY_ID
+        _uv_write_json(path, {"version": 1, "active": active, "presets": presets})
+        return True
+    except Exception:
+        return False
+
+
+def uv_preset_name(now, existing_names):
+    """D11: a new preset is named after the moment it was saved, 24-hour
+    "HH:MM DD-MM" (e.g. "14:32 07-10" for 7 October). A second SAVE in the
+    same minute becomes "14:32 07-10 (2)", then "(3)" ..."""
+    base = time.strftime("%H:%M %d-%m", _uv_localtime(now))
+    taken = set(existing_names)
+    if base not in taken:
+        return base
+    n = 2
+    while "{} ({})".format(base, n) in taken:
+        n += 1
+    return "{} ({})".format(base, n)
+
+
+def uv_preset_id(now, existing_ids):
+    """A unique id for a new preset: names can repeat after a delete (the
+    same minute saved again), ids must not."""
+    base = "p{}".format(time.strftime("%Y%m%d%H%M%S", _uv_localtime(now)))
+    taken = set(existing_ids) | {UV_FACTORY_ID}
+    pid, n = base, 2
+    while pid in taken:
+        pid, n = "{}-{}".format(base, n), n + 1
+    return pid
+
+
+def uv_find_export_dir(home=None, media_root=UV_MEDIA_ROOT, user=None):
+    """D12: where EXPORT writes. The first writable mounted USB stick --
+    Raspberry Pi OS mounts them at /media/<user>/<label>; a bare
+    /media/<label> is checked too -- gets <stick>/Endoscope_UV_presets.
+    With no stick it goes to ~/Endoscope_UV_presets. Returns (dir, is_usb)."""
+    home = home or os.path.expanduser("~")
+    user = (user or os.environ.get("USER") or os.environ.get("LOGNAME")
+            or os.path.basename(os.path.normpath(home)))
+    for parent in (os.path.join(media_root, user), media_root):
+        try:
+            names = sorted(os.listdir(parent))
+        except OSError:
+            continue
+        for name in names:
+            cand = os.path.join(parent, name)
+            try:
+                if (os.path.isdir(cand) and os.path.ismount(cand)
+                        and os.access(cand, os.W_OK)):
+                    return os.path.join(cand, UV_EXPORT_DIRNAME), True
+            except OSError:
+                continue
+    return os.path.join(home, UV_EXPORT_DIRNAME), False
+
+
+def _uv_safe_name(name):
+    s = re.sub(r"[^A-Za-z0-9_-]+", "_", str(name)).strip("_")
+    return s or "preset"
+
+
+def uv_export(dest_dir, presets, toggles, now=None, sync=False):
+    """Write one UVScope1.1 "Load config" file per preset plus one bundle of
+    all of them into dest_dir; returns the written paths. Each file is the
+    full UVParams field set, with the four enable switches taken from the
+    live bar toggles (so UVScope shows what the operator was looking at),
+    plus three extra keys UVScope ignores. Raises OSError on failure; the
+    caller reports it. sync=True (a USB stick) flushes the kernel's write
+    cache, so pulling the stick right after the toast loses nothing."""
+    tm = _uv_localtime(now)
+    stamp_min = time.strftime("%Y%m%d-%H%M", tm)
+    stamp_sec = time.strftime("%Y%m%d-%H%M%S", tm)
+    os.makedirs(dest_dir, exist_ok=True)
+    boost = bool(toggles.get("boost", True))
+    boxes = bool(toggles.get("boxes", True))
+    filt = bool(toggles.get("filter", False))
+    written, used, bundle = [], set(), []
+    for preset in presets:
+        params = preset["params"]
+        if not isinstance(params, UVParams):
+            params = UVParams.from_dict(params)
+        d = _uv_params_json(params)
+        d.update({"filter_enabled": filt, "boost_enabled": boost,
+                  "draw_boxes": boxes, "detect_enabled": boost or boxes,
+                  "preset_name": str(preset["name"]),
+                  "ref_short_side": UV_REF_SHORT_SIDE,
+                  "exported_by": UV_EXPORTED_BY})
+        safe, n = _uv_safe_name(preset["name"]), 2
+        fname = "uv_params_{}_{}.json".format(stamp_min, safe)
+        while fname in used:            # "a b" and "a_b" both make a_b
+            fname = "uv_params_{}_{}_{}.json".format(stamp_min, safe, n)
+            n += 1
+        used.add(fname)
+        path = os.path.join(dest_dir, fname)
+        _uv_write_json(path, d)
+        written.append(path)
+        bundle.append(d)
+    path = os.path.join(dest_dir, "uv_presets_all_{}.json".format(stamp_sec))
+    _uv_write_json(path, {"exported_by": UV_EXPORTED_BY,
+                          "exported_at": time.strftime("%Y-%m-%dT%H:%M:%S", tm),
+                          "ref_short_side": UV_REF_SHORT_SIDE,
+                          "toggles": {"boost": boost, "boxes": boxes,
+                                      "filter": filt},
+                          "presets": bundle})
+    written.append(path)
+    if sync and hasattr(os, "sync"):
+        os.sync()
+    return written
+
+
+# Drawer rows (§3.6), top to bottom. ("value", field, label, decimals, x):
+# ranges come from UV_UI_RANGES (== UVScope's PANEL), shown with UVScope's
+# decimals, and x is UVScope's display multiplier (min region is edited as
+# a percentage). One -/+ tap moves one slider notch: 10**-decimals / x.
+UV_DRAWER_ROWS = [
+    ("head", "FILTER"),
+    ("value", "filter_strength", "Strength", 2, 1.0),
+    ("value", "blue_cut", "Blue cut", 2, 1.0),
+    ("value", "warmth", "Warmth", 2, 1.0),
+    ("value", "exposure", "Exposure", 2, 1.0),
+    ("value", "gamma", "Gamma", 2, 1.0),
+    ("head", "DETECTION"),
+    ("dye", "dye", "Dye type"),
+    ("value", "sensitivity", "Sensitivity", 0, 1.0),
+    ("value", "hue_min", "Hue min", 0, 1.0),
+    ("value", "hue_max", "Hue max", 0, 1.0),
+    ("value", "sat_min", "Saturation min", 0, 1.0),
+    ("value", "val_min", "Brightness min", 0, 1.0),
+    ("toggle", "uv_reject", "Reject UV wash"),
+    ("value", "uv_reject_min", "Rejection strength", 0, 1.0),
+    ("value", "min_area_ratio", "Min region (%)", 3, 100.0),
+    ("value", "merge_px", "Merge nearby (px)", 0, 1.0),
+    ("value", "open_px", "Noise filter (px)", 0, 1.0),
+    ("head", "BOOST"),
+    ("value", "boost_sat", "Saturation gain", 2, 1.0),
+    ("value", "boost_val", "Brightness gain", 2, 1.0),
+    ("value", "boost_blue_cut", "Blue cut inside", 2, 1.0),
+    ("value", "feather_px", "Edge feather (px)", 0, 1.0),
+    ("head", "BOX"),
+    ("value", "box_thickness", "Line width", 0, 1.0),
+    ("colour", "box_bgr", "Box colour"),
+    ("toggle", "show_labels", "Show ID & area %"),
+    ("toggle", "draw_contours", "Outline"),
+    ("value", "track_alpha", "Steadiness", 2, 1.0),
+]
+# A fixed colour cycle instead of UVScope's colour picker (BGR).
+UV_BOX_COLOURS = [("Magenta", (255, 0, 255)), ("Green", (0, 255, 0)),
+                  ("Cyan", (255, 255, 0)), ("Yellow", (0, 255, 255)),
+                  ("Red", (0, 0, 255)), ("White", (255, 255, 255))]
+UV_DRAG_SLOP = 8                # px a finger may wander before a tap is a drag
+UV_DELETE_CONFIRM_S = 3.0
+
+
 # Live-view UV options (UV-PORT-PLAN.md §0 D3/D7, §3.5): the three bottom-bar
 # toggles, remembered in cfg["uv"]. These are the first-ever values; after
 # that the operator's last choice wins. UV mode itself is never remembered --
@@ -3582,10 +3840,37 @@ class App:
             self.uv_tuning_panel = _uv_bool(self.cfg["uv_tuning_panel"])
         except (TypeError, ValueError, OverflowError):
             self.uv_tuning_panel = True
-        self.uv_drawer_open = False
+        self.uv_drawer_open = False     # never persisted: boots closed
+        # Tuning presets (D11). The active preset survives a restart; unsaved
+        # drawer edits live only in self.uv_work and are dropped on a preset
+        # switch or a restart. A missing or damaged file simply means FACTORY.
+        self.uv_presets = uv_presets_load(UV_PRESETS_FILE)
+        self.uv_active_id = self.uv_presets["active"]
+        self.uv_work = self._uv_preset_params(self.uv_active_id)
+        self.uv_drawer = None           # the drawer Frame while it is on screen
+        self.uv_dh = None               # its fixed header canvas
+        self.uv_db = None               # its scrolling body canvas
+        self.uv_tab = None              # (x0, y0, x1, y1) of the arrow tab
+        self._uv_list_open = False      # body shows the preset list, not rows
+        self._uv_scroll = 0             # body scroll (px), kept across rebuilds
+        self._uv_list_scroll = 0
+        self._uv_moved = 0              # px the body items are currently moved up
+        self._uv_content_h = 0
+        self._uv_body_h = 1
+        self._uv_rows = {}
+        self._uv_hits = []              # body tap/drag targets, content coords
+        self._uv_hhits = []             # header tap targets
+        self._uv_drag = None            # the finger gesture in progress
+        self._uv_hpress = None
+        self._uv_del_until = 0.0        # DELETE armed ("CONFIRM?") until then
+        self._uv_del_after = None
+        self._uv_ms = None              # last UV processing time
+        self._uv_ms_t = 0.0
+        self._uv_bar_state = "normal"
         self.uv_mode_btn = None
         self.uv_bar = []                # [(name, x0, y0, x1, y1, text item)] in UV RUN
         self.uv_bar_box = None          # the bar's whole backdrop rectangle
+        self.uv_bar_bg = []             # its plain-background rectangles
         self._uv_shape = None           # frame size the tracked boxes belong to
         self._uv_gen = None             # link generation they belong to
         self._uv_stale = False
@@ -3903,6 +4188,13 @@ class App:
         size = max(13, int(self.H / 26))
         w = self.text_w(text, size, True) + 60
         x, y = self.W / 2, self.H * 0.78
+        if getattr(self, "uv_drawer", None) is not None:
+            # Centre on the picture beside the open tuning drawer (which
+            # would hide half the toast), shrinking a long one to fit there.
+            x, _, room, _ = self._video_rect()
+            while size > 10 and w > room - 20:
+                size -= 1
+                w = self.text_w(text, size, True) + 60
         bar = getattr(self, "uv_bar_box", None)
         if bar:
             # Sit above the UV option bar, never on it: the bar must stay
@@ -3950,6 +4242,8 @@ class App:
         self.uv_mode_btn = None
         self.uv_bar = []
         self.uv_bar_box = None
+        self.uv_bar_bg = []
+        self._uv_destroy_drawer()       # enter_run rebuilds it if still wanted
         if stage != self.STAGE_RUN:
             self.canvas.itemconfigure(self.video_item, image="")
             self.photo = None
@@ -4324,9 +4618,9 @@ class App:
         self.uv_mode_btn = self.button(
             pad, flip_y, "UV MODE", "#7b1fa2" if self.uv_mode else "#455a64",
             self.toggle_uv_mode, flip_size, store=self.hud, anchor="nw")[:2]
-        zero_w = self.button(W - pad, H - pad, "ZERO", "#1565c0",
-                             self.zero_inplace, bs, store=self.hud,
-                             anchor="se")[2]
+        zero_w, zero_h = self.button(W - pad, H - pad, "ZERO", "#1565c0",
+                                     self.zero_inplace, bs, store=self.hud,
+                                     anchor="se")[2:]
         if self.args.legacy_colour_tools and not self.clean_video:
             self.button(pad, H - pad - int(H * 0.055), "COLOR", "#455a64",
                         self.cycle_colour, max(10, int(H / 38)),
@@ -4362,31 +4656,46 @@ class App:
                                        fill=MUTED,
                                        font=self.f(max(8, H // 62)))
         self.hud.append(self.statusbar)
-        self.nosignal = c.create_text(W / 2, H / 2, text="NO VIDEO SIGNAL",
+        nx = self._video_rect()[0] if self._uv_drawer_shown() else W / 2
+        self.nosignal = c.create_text(nx, H / 2, text="NO VIDEO SIGNAL",
                                       fill=MUTED,
                                       font=self.f(max(15, int(H / 20)), True),
                                       state="hidden")
         self.hud.append(self.nosignal)
         if self.uv_mode:
             self._uv_build_bar(pad, zero_w)
+            if self.uv_tuning_panel:
+                # The arrow tab lives in the free strip between the indicator
+                # panel and ZERO / the option bar, clear of every button.
+                gap = max(6, H // 100)
+                self._uv_build_tab(py + panel + gap,
+                                   min(H - pad - zero_h, self.uv_bar_box[1]) - gap)
+                if self.uv_drawer_open:
+                    self._uv_build_drawer()
 
     # ---- UV fluorescence mode (UV-PORT-PLAN.md §3.3-§3.5, §3.8)
 
     def _uv_base_params(self):
-        """The UV parameters the bottom-bar toggles are layered on. Item-5
-        hook: the tuning drawer makes this return the active preset."""
-        return UVParams()
+        """The UV parameters the bottom-bar toggles are layered on: the
+        active preset plus any unsaved tuning-drawer edits."""
+        return self.uv_work.copy()
 
     def _video_rect(self):
         """(centre x, centre y, width, height) the live picture is fitted
-        into. Item-5 hook: an open tuning drawer narrows it so the whole
-        picture stays visible beside the drawer."""
-        return self.W // 2, self.H // 2, self.W, self.H
+        into. An open tuning drawer narrows it to the strip left of the
+        drawer and its tab, so the whole picture stays visible beside it."""
+        if not self._uv_drawer_shown():
+            return self.W // 2, self.H // 2, self.W, self.H
+        tab_w, panel_w = self._uv_drawer_dims()
+        avail = self.W - panel_w - tab_w
+        return avail // 2, self.H // 2, avail, self.H
 
-    def _uv_apply_opts(self):
+    def _uv_apply_opts(self, reset=True):
         """Push the three bar toggles into the processor. Detection runs
         whenever anything needs its regions: BOOST recolours them, SMART BOX
-        outlines them."""
+        outlines them. reset=False is for tuning-drawer edits: resetting the
+        tracker on every slider notch would blank the boxes for the whole
+        drag, exactly while the engineer is watching them."""
         p = self._uv_base_params().copy()
         p.filter_enabled = self.uv_opts["filter"]
         p.boost_enabled = self.uv_opts["boost"]
@@ -4395,7 +4704,8 @@ class App:
         if self._uv_slow and (not p.analysis_width or p.analysis_width > 320):
             p.analysis_width = 320      # the perf guard outlives a toggle
         self.uv_proc.set_params(p)
-        self.uv_proc.reset()
+        if reset:
+            self.uv_proc.reset()
 
     def _uv_label(self, name, on=None):
         text = {"boost": "BOOST", "boxes": "SMART BOX", "filter": "FILTER",
@@ -4420,8 +4730,12 @@ class App:
         cx = self._video_rect()[0]
         gap = max(6, H // 100)
         bottom = H - pad - self.font_obj(max(8, H // 62)).metrics("linespace") - gap
-        half = min(cx - pad, W - pad - zero_w - gap - cx)
-        names = ("boost", "boxes", "filter", "exit")
+        right = W - pad - zero_w - gap
+        if self._uv_drawer_shown():
+            right = min(right, self._video_rect()[2] - gap)  # left of the drawer
+        half = min(cx - pad, right - cx)
+        self._uv_bar_state = "normal"
+        names =("boost", "boxes", "filter", "exit")
         # Widths are measured WITH the check mark so the buttons never move
         # when one is toggled. Start at the MIRROR/FLIP size and shrink the
         # padding, then the font, until the bar fits a narrow screen.
@@ -4439,15 +4753,47 @@ class App:
         x = int(round(cx - total / 2.0))
         y1 = int(bottom)
         self.uv_bar_box = (x, y1 - bh - inner * 2, x + total, y1)
+        # Where the picture does NOT reach under the bar (a picture shrunk
+        # beside the open tuning drawer, or no signal at all), these plain
+        # rectangles show the same blend over the black background. They
+        # sit BELOW the video image, so wherever the picture is, its own
+        # blended pixels win and the bar looks the same everywhere.
+        self.uv_bar_bg = [self.canvas.create_rectangle(
+            *self.uv_bar_box, outline="", width=0,
+            fill=self._uv_over_bg(*self._uv_bar_colour(None)))]
         x += inner
         for name, w in zip(names, widths):
             bx0, by0, bx1, by1 = x, y1 - inner - bh, x + w, y1 - inner
+            self.uv_bar_bg.append(self.canvas.create_rectangle(
+                bx0, by0, bx1, by1, outline="", width=0,
+                fill=self._uv_over_bg(*self._uv_bar_colour(name))))
             t = self.canvas.create_text((bx0 + bx1) / 2.0, (by0 + by1) / 2.0,
                                         text=self._uv_label(name),
                                         fill="white", font=self.f(size, True))
             self.hud.append(t)
             self.uv_bar.append((name, bx0, by0, bx1, by1, t))
             x = bx1 + gap
+        self.stage_items.extend(self.uv_bar_bg)
+        for r in reversed(self.uv_bar_bg):  # backdrop ends up undermost
+            self.canvas.tag_lower(r)
+
+    def _uv_bar_colour(self, name):
+        """(BGR, alpha) of a bar button background; name None = backdrop."""
+        if name is None:
+            return (0, 0, 0), 0.25
+        if name == "exit":
+            return (0x28, 0x28, 0xc6), 0.60                     # #c62828
+        if self.uv_opts[name]:
+            return (0x32, 0x7d, 0x2e), 0.60                     # #2e7d32
+        return (0x64, 0x5a, 0x45), 0.45                         # #455a64
+
+    @staticmethod
+    def _uv_over_bg(bgr, alpha):
+        """Tk colour of bgr blended at alpha over the BG colour."""
+        bg = (0x0b, 0x09, 0x06)                                 # BG, as BGR
+        b, g, r = (int(c * alpha + k * (1.0 - alpha) + 0.5)
+                   for c, k in zip(bgr, bg))
+        return "#{:02x}{:02x}{:02x}".format(r, g, b)
 
     def _uv_paint_bar(self, small, vx, vy):
         """Blend the bar's backgrounds into the displayed image where the
@@ -4466,15 +4812,9 @@ class App:
             roi[...] = (roi.astype(np.float32) * (1.0 - alpha)
                         + np.array(bgr, np.float32) * alpha + 0.5).astype(np.uint8)
 
-        blend(self.uv_bar_box, (0, 0, 0), 0.25)
+        blend(self.uv_bar_box, *self._uv_bar_colour(None))
         for name, x0, y0, x1, y1, _ in self.uv_bar:
-            if name == "exit":
-                bgr, alpha = (0x28, 0x28, 0xc6), 0.60            # #c62828
-            elif self.uv_opts[name]:
-                bgr, alpha = (0x32, 0x7d, 0x2e), 0.60            # #2e7d32
-            else:
-                bgr, alpha = (0x64, 0x5a, 0x45), 0.45            # #455a64
-            blend((x0, y0, x1, y1), bgr, alpha)
+            blend((x0, y0, x1, y1), *self._uv_bar_colour(name))
 
     def _uv_draw_regions(self, small, info, frame_shape):
         """SMART BOX: outline the tracked regions at DISPLAY resolution, so a
@@ -4528,6 +4868,7 @@ class App:
                 self._uv_shape = frame.shape[:2]
                 self.uv_proc.reset()    # old boxes are in the old size's pixels
             out, info = self.uv_proc.process(frame, draw=False)
+            self._uv_ms = info.get("ms")
             self._uv_perf_guard(info.get("ms", 0.0))
             return out, info
         except Exception:
@@ -4576,6 +4917,8 @@ class App:
     def _uv_bar_click(self, event):
         if self.stage != self.STAGE_RUN or not self.uv_mode:
             return
+        if self.diag_photo is not None:
+            return                      # legacy DIAG grid: the bar is hidden
         for name, x0, y0, x1, y1, _ in self.uv_bar:
             if x0 <= event.x < x1 and y0 <= event.y < y1:
                 if name == "exit":
@@ -4591,6 +4934,7 @@ class App:
             self._uv_shape = None
         else:
             self.uv_drawer_open = False
+            self._uv_list_open = False
         self.last_seq = -1
         if self.stage == self.STAGE_RUN:
             self.set_stage(self.STAGE_RUN)  # rebuilds the button and the bar
@@ -4604,10 +4948,680 @@ class App:
         self.save_cfg()
         self._uv_apply_opts()
         self.last_seq = -1              # repaint the bar backgrounds now
-        for n, _, _, _, _, t in self.uv_bar:
+        for (n, _, _, _, _, t), r in zip(self.uv_bar, self.uv_bar_bg[1:]):
             self.canvas.itemconfigure(t, text=self._uv_label(n))
+            self.canvas.itemconfigure(
+                r, fill=self._uv_over_bg(*self._uv_bar_colour(n)))
         self.toast(self._uv_label(name, False) + ": "
                    + ("ON" if self.uv_opts[name] else "OFF"), OK, ms=1200)
+
+    def _uv_tick(self):
+        """Per-frame UV housekeeping that is not pixels: hide the bar labels
+        while the legacy DIAG grid is frozen on screen (the bar backgrounds
+        are not painted over it, so bare labels would float on the grid),
+        and refresh the drawer's processing time a few times a second."""
+        want = "hidden" if self.diag_photo is not None else "normal"
+        if self.uv_bar and want != self._uv_bar_state:
+            self._uv_bar_state = want
+            for item in [b[5] for b in self.uv_bar] + self.uv_bar_bg:
+                self.canvas.itemconfigure(item, state=want)
+        now = time.monotonic()
+        if self.uv_drawer is not None and now - self._uv_ms_t >= 0.25:
+            self._uv_ms_t = now
+            self.uv_dh.itemconfigure(
+                self._uv_ms_item, text=("UV {:.0f} ms".format(self._uv_ms)
+                                        if self._uv_ms is not None else "UV -- ms"))
+
+    # ---- UV tuning drawer (D10-D12, UV-PORT-PLAN.md §3.6/§3.7)
+    #
+    # A test-version tool for the engineer, not the operator: a tab on the
+    # right edge slides out a panel of the detector/boost/filter numbers,
+    # with presets and a USB export so a good tuning can be carried back to
+    # UVScope and baked into the next release's FACTORY. Everything is sized
+    # for a fingertip (no hover, no right click, no wheel on the device): a
+    # press on a slider track drags the value, a press anywhere else that
+    # moves scrolls the panel, and a short tap acts on release.
+
+    def _uv_drawer_shown(self):
+        return bool(getattr(self, "uv_drawer_open", False)
+                    and getattr(self, "uv_mode", False)
+                    and getattr(self, "uv_tuning_panel", False)
+                    and getattr(self, "stage", None) == self.STAGE_RUN)
+
+    def _uv_drawer_dims(self):
+        """(tab strip width, panel width). The panel is ~38% of the screen
+        and never under 300 px, but with the tab strip beside it never more
+        than 55% -- the picture always keeps at least 45% of the width. The
+        open tab gets its own strip so it never covers the picture."""
+        W, H = self.W, self.H
+        tab_w = max(40, int(H * 0.075))
+        panel_w = max(300, int(W * 0.38))
+        panel_w = min(panel_w, W - int(math.ceil(W * 0.45)) - tab_w)
+        return tab_w, max(1, panel_w)
+
+    def _uv_metrics(self):
+        """Drawer sizes, all scaled with the screen height: u is the height
+        of every touch target (45 px on a 600 px screen)."""
+        H = self.H
+        return {"u": max(36, int(H * 0.075)), "m": max(6, H // 64),
+                "fs": max(10, int(H / 44)), "fh": max(10, int(H / 40)),
+                "fpm": max(14, int(H / 24))}
+
+    def _uv_round_rect(self, c, x0, y0, x1, y1, r, square_right=False, **kw):
+        """A rounded-looking rectangle: a smoothed polygon whose doubled
+        points keep the straight edges straight."""
+        rr = 0 if square_right else r
+        pts = [x0 + r, y0, x0 + r, y0, x1 - rr, y0, x1 - rr, y0, x1, y0,
+               x1, y0 + rr, x1, y0 + rr, x1, y1 - rr, x1, y1 - rr, x1, y1,
+               x1 - rr, y1, x1 - rr, y1, x0 + r, y1, x0 + r, y1, x0, y1,
+               x0, y1 - r, x0, y1 - r, x0, y0 + r, x0, y0 + r, x0, y0]
+        return c.create_polygon(pts, smooth=True, **kw)
+
+    def _uv_fit(self, text, size, bold, room):
+        """Trim text with an ellipsis until it fits room px (cached fonts)."""
+        if self.text_w(text, size, bold) <= room:
+            return text
+        while len(text) > 1 and self.text_w(text + "…", size, bold) > room:
+            text = text[:-1]
+        return text + "…"
+
+    def _uv_build_tab(self, top, bottom):
+        """The arrow tab: at the right screen edge when the drawer is
+        closed, at the drawer's left edge when it is open."""
+        c, W, H = self.canvas, self.W, self.H
+        tab_w, panel_w = self._uv_drawer_dims()
+        tab_h = max(80, int(H * 0.17))
+        x1 = W - panel_w if self.uv_drawer_open else W
+        x0 = x1 - tab_w
+        cy = (top + bottom) / 2.0 if bottom - top >= tab_h else H * 0.55
+        y0, y1 = int(cy - tab_h / 2), int(cy + tab_h / 2)
+        poly = self._uv_round_rect(c, x0, y0, x1 + 2, y1, max(6, tab_w // 3),
+                                   square_right=True, fill="#263238",
+                                   outline=EDGE, width=2, tags="uv_tab")
+        text = c.create_text((x0 + x1) / 2.0, cy,
+                             text="▶" if self.uv_drawer_open else "◀",
+                             fill="white", font=self.f(max(14, int(H / 30)), True),
+                             tags="uv_tab")
+        for item in (poly, text):
+            c.tag_bind(item, "<Button-1>", lambda e: self.toggle_uv_drawer())
+        self.hud.extend([poly, text])
+        self.uv_tab = (x0, y0, x1, y1)
+
+    def toggle_uv_drawer(self):
+        if (not self.uv_mode or not self.uv_tuning_panel
+                or self.stage != self.STAGE_RUN):
+            return
+        self.uv_drawer_open = not self.uv_drawer_open
+        if not self.uv_drawer_open:
+            self._uv_list_open = False
+        self.last_seq = -1              # refit the picture to the new rect now
+        self.set_stage(self.STAGE_RUN)  # re-centres the bar, moves the tab
+
+    def _uv_destroy_drawer(self):
+        self._uv_del_disarm(refresh=False)
+        if getattr(self, "uv_drawer", None) is not None:
+            try:
+                self.uv_drawer.destroy()
+            except tk.TclError:
+                pass
+        self.uv_drawer = self.uv_dh = self.uv_db = None
+        self._uv_drag = self._uv_hpress = None
+
+    def _uv_header_h(self):
+        k = self._uv_metrics()
+        return k["m"] * 4 + int(k["u"] * 0.7) + k["u"] * 2
+
+    def _uv_build_drawer(self):
+        W, H = self.W, self.H
+        tab_w, panel_w = self._uv_drawer_dims()
+        hh = self._uv_header_h()
+        fr = tk.Frame(self.root, bg=EDGE, bd=0, highlightthickness=0)
+        fr.place(x=W - panel_w, y=0, width=panel_w, height=H)
+        cw = panel_w - 2                # a 2 px EDGE-coloured left border
+        self.uv_dh = tk.Canvas(fr, width=cw, height=hh, bg=PANEL,
+                               highlightthickness=0, bd=0)
+        self.uv_dh.place(x=2, y=0, width=cw, height=hh)
+        self._uv_body_h = max(1, H - hh)
+        self.uv_db = tk.Canvas(fr, width=cw, height=self._uv_body_h, bg=PANEL,
+                               highlightthickness=0, bd=0)
+        self.uv_db.place(x=2, y=hh, width=cw, height=self._uv_body_h)
+        self.uv_drawer = fr
+        self._uv_cw = cw
+        self.uv_dh.bind("<ButtonPress-1>", self._uv_head_press)
+        self.uv_dh.bind("<ButtonRelease-1>", self._uv_head_release)
+        self.uv_db.bind("<ButtonPress-1>", self._uv_body_press)
+        self.uv_db.bind("<B1-Motion>", self._uv_body_motion)
+        self.uv_db.bind("<ButtonRelease-1>", self._uv_body_release)
+        # Mouse wheel is a development convenience; the device is touch.
+        self.uv_db.bind("<MouseWheel>", self._uv_wheel)
+        self.uv_db.bind("<Button-4>", self._uv_wheel)
+        self.uv_db.bind("<Button-5>", self._uv_wheel)
+        self._uv_build_header()
+        self._uv_build_body()
+        self._uv_ms_t = 0.0
+        fr.lift()
+
+    def _uv_build_header(self):
+        c, k, w = self.uv_dh, self._uv_metrics(), self._uv_cw
+        u, m, fs = k["u"], k["m"], k["fs"]
+        c.delete("all")
+        self._uv_hhits = []
+        th = int(u * 0.7)
+        y = m
+        c.create_text(m, y + th / 2.0, anchor="w", text="UV TUNING",
+                      fill="#ce93d8", font=self.f(k["fh"], True))
+        self._uv_ms_item = c.create_text(w - m, y + th / 2.0, anchor="e",
+                                         text="UV -- ms", fill=DIM,
+                                         font=self.f(fs))
+        y += th + m
+        self._uv_round_rect(c, m, y, w - m, y + u, 8, fill="#1c262b",
+                            outline=EDGE, width=1)
+        self._uv_name_item = c.create_text(m + 12, y + u / 2.0, anchor="w",
+                                           text="", fill="white",
+                                           font=self.f(fs + 1, True))
+        self._uv_arrow_item = c.create_text(w - m - 14, y + u / 2.0, anchor="e",
+                                            text="", fill=DIM,
+                                            font=self.f(fs, True))
+        self._uv_hhits.append(("list", m, y, w - m, y + u))
+        y += u + m
+        bw = (w - 4 * m) / 3.0
+        bfs = fs                        # "CONFIRM?" must fit a narrow screen
+        while bfs > 8 and self.text_w("CONFIRM?", bfs, True) > bw - 10:
+            bfs -= 1
+        self._uv_hbtn = {}
+        for i, (key, label, fill) in enumerate((("save", "SAVE", "#2e7d32"),
+                                                ("delete", "DELETE", "#455a64"),
+                                                ("export", "EXPORT", "#1565c0"))):
+            x0 = m + i * (bw + m)
+            r = self._uv_round_rect(c, x0, y, x0 + bw, y + u, 8, fill=fill,
+                                    outline="")
+            t = c.create_text(x0 + bw / 2.0, y + u / 2.0, text=label,
+                              fill="white", font=self.f(bfs, True))
+            self._uv_hbtn[key] = (r, t)
+            self._uv_hhits.append((key, x0, y, x0 + bw, y + u))
+        y += u + m
+        c.create_line(0, y - 1, w, y - 1, fill=EDGE, width=2)
+        self._uv_header_refresh()
+
+    def _uv_build_body(self):
+        """(Re)draw the scrolling part: the parameter rows, or the preset
+        list while it is open. Items are drawn in content coordinates and
+        moved up by the scroll offset (tag "content")."""
+        c = self.uv_db
+        c.delete("all")
+        self._uv_hits = []
+        self._uv_rows = {}
+        self._uv_moved = 0
+        if self._uv_list_open:
+            self._uv_content_h = self._uv_build_list(c)
+            self._uv_scroll_to(self._uv_list_scroll)
+        else:
+            self._uv_content_h = self._uv_build_rows(c)
+            self._uv_scroll_to(self._uv_scroll)
+
+    def _uv_build_rows(self, c):
+        k, w = self._uv_metrics(), self._uv_cw
+        u, m, fs = k["u"], k["m"], k["fs"]
+        lh = int(u * 0.6)               # label line above a control
+        tag = ("content",)
+        y = m
+        for spec in UV_DRAWER_ROWS:
+            kind = spec[0]
+            if kind == "head":
+                hh = int(u * 0.8)
+                ty = y + hh * 0.55
+                c.create_text(m, ty, anchor="w", text=spec[1], fill="#ce93d8",
+                              font=self.f(k["fh"], True), tags=tag)
+                c.create_line(m + self.text_w(spec[1], k["fh"], True) + 10, ty,
+                              w - m, ty, fill=EDGE, tags=tag)
+                y += hh
+                continue
+            field, label = spec[1], spec[2]
+            row = {"kind": kind, "spec": spec}
+            if kind == "toggle":
+                c.create_text(m, y + u / 2.0, anchor="w", text=label,
+                              fill="#cfd8dc", font=self.f(fs), tags=tag)
+                x0 = w - m - int(u * 1.9)
+                row["rect"] = self._uv_round_rect(c, x0, y, w - m, y + u, 8,
+                                                  fill="#455a64", outline="",
+                                                  tags=tag)
+                row["text"] = c.create_text((x0 + w - m) / 2.0, y + u / 2.0,
+                                            text="", fill="white",
+                                            font=self.f(fs, True), tags=tag)
+                self._uv_hits.append((0, y, w, y + u, "toggle", field))
+                y += u + m
+            elif kind in ("dye", "colour"):
+                c.create_text(m, y + lh / 2.0, anchor="w", text=label,
+                              fill="#cfd8dc", font=self.f(fs), tags=tag)
+                y += lh
+                self._uv_round_rect(c, m, y, w - m, y + u, 8, fill="#263238",
+                                    outline=EDGE, tags=tag)
+                tx = m + 12
+                if kind == "colour":
+                    s = int(u * 0.5)
+                    row["swatch"] = c.create_rectangle(
+                        tx, y + (u - s) / 2.0, tx + s, y + (u + s) / 2.0,
+                        fill="#ff00ff", outline="white", tags=tag)
+                    tx += s + 10
+                row["text"] = c.create_text(tx, y + u / 2.0, anchor="w", text="",
+                                            fill="white", font=self.f(fs, True),
+                                            tags=tag)
+                row["room"] = w - m - 30 - tx
+                c.create_text(w - m - 12, y + u / 2.0, anchor="e", text="▶",
+                              fill=DIM, font=self.f(fs), tags=tag)
+                self._uv_hits.append((m, y, w - m, y + u, "cycle", field))
+                y += u + m
+            else:
+                c.create_text(m, y + lh / 2.0, anchor="w", text=label,
+                              fill="#cfd8dc", font=self.f(fs), tags=tag)
+                row["value"] = c.create_text(w - m, y + lh / 2.0, anchor="e",
+                                             text="", fill="#b39ddb",
+                                             font=self.f(fs + 1, True), tags=tag)
+                y += lh
+                bw = int(u * 1.15)
+                for key, x0, glyph in (("minus", m, "−"),
+                                       ("plus", w - m - bw, "+")):
+                    self._uv_round_rect(c, x0, y, x0 + bw, y + u, 8,
+                                        fill="#37474f", outline="", tags=tag)
+                    c.create_text(x0 + bw / 2.0, y + u / 2.0, text=glyph,
+                                  fill="white", font=self.f(k["fpm"], True),
+                                  tags=tag)
+                    self._uv_hits.append((x0, y, x0 + bw, y + u, key, field))
+                kr = max(8, int(u * 0.3))
+                tx0, tx1 = m + bw + m + kr, w - m - bw - m - kr
+                cy = y + u / 2.0
+                c.create_rectangle(tx0, cy - 3, tx1, cy + 3, fill="#37474f",
+                                   outline="", tags=tag)
+                row["fill"] = c.create_rectangle(tx0, cy - 3, tx0, cy + 3,
+                                                 fill="#8b6fe8", outline="",
+                                                 tags=tag)
+                row["knob"] = c.create_oval(tx0 - kr, cy - kr, tx0 + kr, cy + kr,
+                                            fill="#eceff1", outline="#8b6fe8",
+                                            width=2, tags=tag)
+                row["tx"] = (tx0, tx1)
+                # The whole strip between - and + grabs the knob: a finger
+                # does not have to land on the 6 px track itself.
+                self._uv_hits.append((m + bw, y, w - m - bw, y + u, "track", field))
+                y += u + m
+            self._uv_rows[field] = row
+        for field in self._uv_rows:
+            self._uv_row_refresh(field)
+        return y + m
+
+    def _uv_build_list(self, c):
+        k, w = self._uv_metrics(), self._uv_cw
+        u, m, fs = k["u"], k["m"], k["fs"]
+        tag = ("content",)
+        y = m
+        entries = [(UV_FACTORY_ID, UV_FACTORY_NAME)] + [
+            (p["id"], p["name"]) for p in self.uv_presets["presets"]]
+        for pid, name in entries:
+            active = pid == self.uv_active_id
+            self._uv_round_rect(c, m, y, w - m, y + u, 8,
+                                fill="#4a148c" if active else "#263238",
+                                outline="#ce93d8" if active else EDGE, tags=tag)
+            c.create_text(m + 14, y + u / 2.0, anchor="w",
+                          text=("✓  " if active else "     ") + name,
+                          fill="white", font=self.f(fs + 1, True), tags=tag)
+            self._uv_hits.append((m, y, w - m, y + u, "preset", pid))
+            y += u + m
+        if self._uv_dirty():
+            c.create_text(w / 2.0, y + u * 0.3, text="Unsaved changes are lost "
+                          "when another preset loads", fill=WARN,
+                          font=self.f(max(9, fs - 1)), width=w - 2 * m, tags=tag)
+            y += u
+        return y + m
+
+    def _uv_scroll_to(self, px):
+        """Scroll the body so content y = px sits at its top edge."""
+        top = max(0, self._uv_content_h - self._uv_body_h)
+        px = int(max(0, min(top, px)))
+        if px != self._uv_moved:
+            self.uv_db.move("content", 0, self._uv_moved - px)
+            self._uv_moved = px
+        if self._uv_list_open:
+            self._uv_list_scroll = px
+        else:
+            self._uv_scroll = px
+        # A thin thumb on the right edge says "there is more below".
+        c = self.uv_db
+        c.delete("uv_thumb")
+        if top > 0:
+            h = self._uv_body_h
+            th = max(24, int(h * h / float(self._uv_content_h)))
+            ty = int((h - th) * px / float(top))
+            c.create_rectangle(self._uv_cw - 4, ty, self._uv_cw, ty + th,
+                               fill="#607d8b", outline="", tags="uv_thumb")
+
+    def _uv_body_target(self, x, y):
+        """The body target under a point in widget coordinates, or None."""
+        y += self._uv_moved
+        for x0, y0, x1, y1, kind, key in self._uv_hits:
+            if x0 <= x < x1 and y0 <= y < y1:
+                return kind, key
+        return None
+
+    def _uv_head_target(self, x, y):
+        for key, x0, y0, x1, y1 in self._uv_hhits:
+            if x0 <= x < x1 and y0 <= y < y1:
+                return key
+        return None
+
+    # -- gestures. A press on a slider track that then moves sideways drags
+    #    the value (and keeps dragging it, however the finger wanders); one
+    #    that moves up/down first is a scroll -- the tracks fill most of the
+    #    panel, so otherwise every scroll would nudge some value. Any other
+    #    press that wanders more than UV_DRAG_SLOP px scrolls and never acts;
+    #    a press that stays put is a tap and acts on release (a tap on a
+    #    track jumps the value there).
+
+    def _uv_body_press(self, e):
+        self._uv_drag = {"hit": self._uv_body_target(e.x, e.y), "x": e.x,
+                         "y": e.y, "off": self._uv_moved, "mode": "tap"}
+
+    def _uv_body_motion(self, e):
+        d = self._uv_drag
+        if not d:
+            return
+        dx, dy = abs(e.x - d["x"]), abs(e.y - d["y"])
+        if d["mode"] == "tap" and max(dx, dy) > UV_DRAG_SLOP:
+            sideways = dx >= dy and d["hit"] and d["hit"][0] == "track"
+            d["mode"] = "track" if sideways else "scroll"
+        if d["mode"] == "track":
+            self._uv_track_set(d["hit"][1], e.x)
+        elif d["mode"] == "scroll":
+            self._uv_scroll_to(d["off"] - (e.y - d["y"]))
+
+    def _uv_body_release(self, e):
+        d, self._uv_drag = self._uv_drag, None
+        if not d or d["mode"] != "tap" or not d["hit"]:
+            return
+        kind, key = d["hit"]
+        if kind == "track":
+            self._uv_track_set(key, e.x)
+        elif kind == "preset":
+            self._uv_activate(key)
+        elif kind in ("minus", "plus"):
+            dec, mul = self._uv_spec(key)[3:5]
+            step = (10.0 ** -dec) * (1 if kind == "plus" else -1)
+            self._uv_set_value(key, (getattr(self.uv_work, key) * mul + step) / mul)
+        elif kind == "toggle":
+            setattr(self.uv_work, key, not getattr(self.uv_work, key))
+            self._uv_edited(key)
+        elif kind == "cycle":
+            self._uv_cycle(key)
+
+    def _uv_wheel(self, e):
+        down = e.num == 5 or (e.num != 4 and getattr(e, "delta", 0) < 0)
+        self._uv_scroll_to(self._uv_moved
+                           + (1 if down else -1) * self._uv_metrics()["u"])
+
+    def _uv_head_press(self, e):
+        self._uv_hpress = (self._uv_head_target(e.x, e.y), e.x, e.y)
+
+    def _uv_head_release(self, e):
+        press, self._uv_hpress = self._uv_hpress, None
+        if not press or press[0] is None:
+            return
+        if (abs(e.x - press[1]) > UV_DRAG_SLOP or abs(e.y - press[2]) > UV_DRAG_SLOP
+                or self._uv_head_target(e.x, e.y) != press[0]):
+            return
+        {"list": self._uv_toggle_list, "save": self.uv_preset_save,
+         "delete": self.uv_preset_delete, "export": self.uv_preset_export}[press[0]]()
+
+    # -- values
+
+    @staticmethod
+    def _uv_spec(field):
+        for spec in UV_DRAWER_ROWS:
+            if spec[0] != "head" and spec[1] == field:
+                return spec
+        raise KeyError(field)
+
+    def _uv_set_value(self, field, v):
+        """Clamp to UVScope's range and snap to its slider notch; True if the
+        value actually changed."""
+        dec, mul = self._uv_spec(field)[3:5]
+        lo, hi = UV_UI_RANGES[field]
+        v = max(lo, min(hi, v))
+        if field in _UV_INT_FIELDS:
+            v = int(round(v))
+        else:
+            v = max(float(lo), min(float(hi), round(round(v * mul, dec) / mul, dec + 4)))
+        if v == getattr(self.uv_work, field):
+            return False
+        setattr(self.uv_work, field, v)
+        self._uv_edited(field)
+        return True
+
+    def _uv_track_set(self, field, x):
+        tx0, tx1 = self._uv_rows[field]["tx"]
+        lo, hi = UV_UI_RANGES[field]
+        frac = max(0.0, min(1.0, (x - tx0) / float(max(1, tx1 - tx0))))
+        self._uv_set_value(field, lo + frac * (hi - lo))
+
+    def _uv_dye_key(self):
+        w = self.uv_work
+        for key, dye in UV_DYE_PRESETS.items():
+            if all(abs(float(getattr(w, k)) - float(v)) < 1e-9
+                   for k, v in dye["params"].items()):
+                return key
+        return None
+
+    def _uv_colour_index(self):
+        bgr = tuple(int(c) for c in self.uv_work.box_bgr)
+        for i, (_, c) in enumerate(UV_BOX_COLOURS):
+            if c == bgr:
+                return i
+        return None
+
+    def _uv_cycle(self, field):
+        if field == "dye":
+            keys = list(UV_DYE_PRESETS)
+            cur = self._uv_dye_key()
+            nxt = keys[(keys.index(cur) + 1) % len(keys)] if cur else keys[0]
+            merged = self.uv_work.to_dict()
+            merged.update(UV_DYE_PRESETS[nxt]["params"])
+            self.uv_work = UVParams.from_dict(merged)
+            for f in self._uv_rows:
+                self._uv_row_refresh(f)
+        else:
+            i = self._uv_colour_index()
+            self.uv_work.box_bgr = UV_BOX_COLOURS[
+                0 if i is None else (i + 1) % len(UV_BOX_COLOURS)][1]
+        self._uv_edited(field)
+
+    def _uv_edited(self, field):
+        """One drawer edit: show it, apply it live (tracker kept), mark the
+        preset name with "*"."""
+        if field in self._uv_rows:
+            self._uv_row_refresh(field)
+        self._uv_header_refresh()
+        self._uv_apply_opts(reset=False)
+        self.last_seq = -1
+
+    def _uv_fmt(self, field):
+        dec, mul = self._uv_spec(field)[3:5]
+        return "{:.{}f}".format(float(getattr(self.uv_work, field)) * mul, dec)
+
+    def _uv_row_refresh(self, field):
+        row, c = self._uv_rows.get(field), self.uv_db
+        if row is None or c is None:
+            return
+        kind, fs = row["kind"], self._uv_metrics()["fs"]
+        if kind == "value":
+            lo, hi = UV_UI_RANGES[field]
+            v = float(getattr(self.uv_work, field))
+            tx0, tx1 = row["tx"]
+            x = tx0 + (tx1 - tx0) * max(0.0, min(1.0, (v - lo) / float(hi - lo)))
+            c.itemconfigure(row["value"], text=self._uv_fmt(field))
+            f = c.coords(row["fill"])
+            c.coords(row["fill"], f[0], f[1], x, f[3])
+            k = c.coords(row["knob"])
+            r = (k[2] - k[0]) / 2.0
+            c.coords(row["knob"], x - r, k[1], x + r, k[3])
+        elif kind == "toggle":
+            on = bool(getattr(self.uv_work, field))
+            c.itemconfigure(row["rect"], fill="#2e7d32" if on else "#455a64")
+            c.itemconfigure(row["text"], text="ON" if on else "OFF")
+        elif kind == "dye":
+            key = self._uv_dye_key()
+            text = UV_DYE_PRESETS[key]["label"] if key else "Custom (tap to choose)"
+            c.itemconfigure(row["text"], text=self._uv_fit(text, fs, True, row["room"]))
+        elif kind == "colour":
+            i = self._uv_colour_index()
+            b, g, r = (int(x) for x in self.uv_work.box_bgr)
+            c.itemconfigure(row["swatch"], fill="#{:02x}{:02x}{:02x}".format(r, g, b))
+            c.itemconfigure(row["text"], text=UV_BOX_COLOURS[i][0] if i is not None
+                            else "Custom")
+
+    # -- presets
+
+    def _uv_preset_params(self, pid):
+        for p in self.uv_presets["presets"]:
+            if p["id"] == pid:
+                return UVParams.from_dict(p["params"])
+        return UVParams()               # FACTORY (D3), or an unknown id
+
+    def _uv_active_name(self):
+        for p in self.uv_presets["presets"]:
+            if p["id"] == self.uv_active_id:
+                return p["name"]
+        return UV_FACTORY_NAME
+
+    def _uv_dirty(self):
+        """True when the working values differ from the active preset's."""
+        return (_uv_params_json(self.uv_work)
+                != _uv_params_json(self._uv_preset_params(self.uv_active_id)))
+
+    def _uv_header_refresh(self):
+        c = self.uv_dh
+        if c is None:
+            return
+        dirty = self._uv_dirty()
+        fs = self._uv_metrics()["fs"]
+        room = self._uv_cw - 2 * self._uv_metrics()["m"] - 60
+        c.itemconfigure(self._uv_name_item, fill=WARN if dirty else "white",
+                        text=self._uv_fit(self._uv_active_name()
+                                          + (" *" if dirty else ""),
+                                          fs + 1, True, room))
+        c.itemconfigure(self._uv_arrow_item,
+                        text="▲" if self._uv_list_open else "▼")
+        rect, text = self._uv_hbtn["delete"]
+        if self.uv_active_id == UV_FACTORY_ID:
+            c.itemconfigure(rect, fill="#263238")
+            c.itemconfigure(text, text="DELETE", fill=MUTED)
+        elif time.monotonic() < self._uv_del_until:
+            c.itemconfigure(rect, fill="#c62828")
+            c.itemconfigure(text, text="CONFIRM?", fill="white")
+        else:
+            c.itemconfigure(rect, fill="#455a64")
+            c.itemconfigure(text, text="DELETE", fill="white")
+
+    def _uv_toggle_list(self):
+        self._uv_list_open = not self._uv_list_open
+        self._uv_list_scroll = 0
+        self._uv_build_body()
+        self._uv_header_refresh()
+
+    def _uv_activate(self, pid, persist=True):
+        """Load a preset (FACTORY or saved): unsaved edits are dropped, the
+        choice is remembered for the next boot, and the tracker restarts
+        because the old boxes came from different thresholds."""
+        known = {p["id"] for p in self.uv_presets["presets"]}
+        self.uv_active_id = pid if pid in known else UV_FACTORY_ID
+        self.uv_presets["active"] = self.uv_active_id
+        self.uv_work = self._uv_preset_params(self.uv_active_id)
+        if persist and (known or os.path.exists(UV_PRESETS_FILE)):
+            if not uv_presets_save(UV_PRESETS_FILE, self.uv_presets):
+                self.toast("PRESET CHOICE NOT SAVED", WARN, ms=2000)
+        self._uv_list_open = False
+        self._uv_del_disarm(refresh=False)
+        self._uv_apply_opts()
+        self.last_seq = -1
+        if self.uv_drawer is not None:
+            self._uv_build_body()
+            self._uv_header_refresh()
+
+    def uv_preset_save(self):
+        """SAVE (D11): always a NEW preset, named by the clock, made active
+        and listed first. FACTORY itself can never be overwritten."""
+        now = time.time()
+        presets = self.uv_presets["presets"]
+        entry = {"id": uv_preset_id(now, [p["id"] for p in presets]),
+                 "name": uv_preset_name(now, [p["name"] for p in presets]
+                                        + [UV_FACTORY_NAME]),
+                 "created": time.strftime("%Y-%m-%dT%H:%M:%S",
+                                          time.localtime(now)),
+                 "params": _uv_params_json(self.uv_work)}
+        data = {"version": 1, "active": entry["id"], "presets": [entry] + presets}
+        if not uv_presets_save(UV_PRESETS_FILE, data):
+            self.toast("SAVE FAILED", ALERT, ms=2500)
+            return
+        self.uv_presets = data
+        self.uv_active_id = entry["id"]
+        self._uv_del_disarm(refresh=False)
+        if self.uv_drawer is not None:
+            if self._uv_list_open:
+                self._uv_build_body()
+            self._uv_header_refresh()
+        self.toast("SAVED " + entry["name"], OK, ms=1500)
+
+    def uv_preset_delete(self):
+        """DELETE (D11): first tap arms it (red CONFIRM? for 3 s), a second
+        tap inside that window deletes. FACTORY cannot be deleted."""
+        if self.uv_active_id == UV_FACTORY_ID:
+            self.toast("FACTORY CANNOT BE DELETED", WARN, ms=1500)
+            return
+        if time.monotonic() >= self._uv_del_until:
+            self._uv_del_disarm(refresh=False)
+            self._uv_del_until = time.monotonic() + UV_DELETE_CONFIRM_S
+            self._uv_del_after = self.root.after(
+                int(UV_DELETE_CONFIRM_S * 1000) + 50, self._uv_del_disarm)
+            self._uv_header_refresh()
+            return
+        self._uv_del_disarm(refresh=False)
+        name = self._uv_active_name()
+        rest = [p for p in self.uv_presets["presets"] if p["id"] != self.uv_active_id]
+        nxt = rest[0]["id"] if rest else UV_FACTORY_ID      # newest left
+        data = {"version": 1, "active": nxt, "presets": rest}
+        if not uv_presets_save(UV_PRESETS_FILE, data):
+            self.toast("DELETE FAILED", ALERT, ms=2500)
+            return
+        self.uv_presets = data
+        self._uv_activate(nxt, persist=False)
+        self.toast("DELETED " + name, OK, ms=1500)
+
+    def _uv_del_disarm(self, refresh=True):
+        after = getattr(self, "_uv_del_after", None)
+        if after is not None:
+            try:
+                self.root.after_cancel(after)
+            except Exception:
+                pass
+        self._uv_del_after = None
+        self._uv_del_until = 0.0
+        if refresh:
+            self._uv_header_refresh()
+
+    def uv_preset_export(self):
+        """EXPORT (D12): FACTORY plus every saved preset, as UVScope1.1
+        config files, to a USB stick if one is mounted, else the home
+        folder. Unsaved edits are not a preset and are not exported."""
+        try:
+            dest, usb = uv_find_export_dir(media_root=UV_MEDIA_ROOT)
+            presets = [{"name": UV_FACTORY_NAME, "params": UVParams()}] + [
+                {"name": p["name"], "params": p["params"]}
+                for p in self.uv_presets["presets"]]
+            paths = uv_export(dest, presets, self.uv_opts, time.time(), sync=usb)
+        except Exception:
+            traceback.print_exc()
+            self.toast("EXPORT FAILED", ALERT, ms=2500)
+            return
+        print("endoscope: UV presets exported to {}".format(dest))
+        where = (os.path.basename(os.path.dirname(dest)) + "/" if usb else "~/")
+        self.toast("EXPORTED {} FILES → {}{}".format(
+            len(paths), where, UV_EXPORT_DIRNAME), OK, ms=3000)
 
     def _apply_video_orientation(self, image):
         """Apply display-only orientation without touching IMU coordinates."""
@@ -5077,6 +6091,7 @@ class App:
 
             if self.uv_mode:
                 self._uv_watch(h)
+                self._uv_tick()
             show = self.diag_photo if self.diag_photo is not None else frame
             fresh = (self.diag_photo is not None) or (frame is not None
                                                       and seq != self.last_seq)
@@ -5117,6 +6132,8 @@ class App:
                 self.canvas.tag_lower(self.video_item)
                 for i in self.hud:
                     self.canvas.tag_raise(i)
+                for i in reversed(self.uv_bar_bg):
+                    self.canvas.tag_lower(i)    # under the picture, see _uv_build_bar
 
             stale = h["frame_age"] > 2.5 and self.diag_photo is None
             self.canvas.itemconfigure(

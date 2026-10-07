@@ -446,6 +446,40 @@ def run_shots_script(app, out_dir):
                 print("uv_preview: tuning drawer not implemented yet "
                       "(skipping 04)")
 
+    def seq_05_scrolled():
+        # Drag the drawer body half way down, as a finger would.
+        if steps_state["drawer_present"] and app.uv_db is not None:
+            app._uv_scroll_to(app._uv_content_h // 2)
+            shot("05_drawer_scrolled.png")
+
+    def seq_05b_bottom():
+        if steps_state["drawer_present"] and app.uv_db is not None:
+            app._uv_scroll_to(app._uv_content_h)       # clamps to the end
+            shot("05b_drawer_bottom.png")
+
+    def seq_06_edited():
+        # A few -/+ taps and a toggle: the preset name gets its "*".
+        if steps_state["drawer_present"] and app.uv_db is not None:
+            app._uv_scroll_to(0)
+            app._uv_set_value("exposure", app.uv_work.exposure + 0.2)
+            app._uv_set_value("box_thickness", 3)
+            app.uv_work.show_labels = True
+            app._uv_edited("show_labels")
+            shot("06_drawer_edited.png")
+
+    def seq_07_list():
+        # SAVE (to the throwaway presets file) then open the preset list.
+        if steps_state["drawer_present"] and app.uv_db is not None:
+            app.uv_preset_save()
+            app._uv_toggle_list()
+            shot("07_preset_list.png")
+
+    def seq_08_confirm():
+        if steps_state["drawer_present"] and app.uv_db is not None:
+            app._uv_toggle_list()
+            app.uv_preset_delete()          # first tap: arms CONFIRM?
+            shot("08_delete_confirm.png")
+
     def seq_04_off():
         if steps_state["drawer_present"]:
             maybe("toggle_uv_drawer")      # close it again
@@ -457,8 +491,9 @@ def run_shots_script(app, out_dir):
     def seq_quit():
         app.quit()
 
-    chain = [seq_01, seq_02, seq_03_on, seq_03_off, seq_04_on, seq_04_off,
-             seq_exit_uv, seq_quit]
+    chain = [seq_01, seq_02, seq_03_on, seq_03_off, seq_04_on,
+             seq_05_scrolled, seq_05b_bottom, seq_06_edited, seq_07_list, seq_08_confirm,
+             seq_04_off, seq_exit_uv, seq_quit]
     STEP_MS = 1000     # leaves room for the 300 ms post-action shot delay
 
     def run_next(i=0):
@@ -512,6 +547,13 @@ def main():
     # Never touch the operator's real ~/.config/endoscope.json.
     tmp_cfg = Path(tempfile.gettempdir()) / "uv_preview_endoscope_cfg.json"
     endoscope.CONFIG = str(tmp_cfg)
+    # Same for the tuning drawer's presets file and EXPORT: a fresh scratch
+    # folder per run, so screenshots never depend on (or add to) earlier runs.
+    scratch = Path(tempfile.mkdtemp(prefix="uv_preview_"))
+    endoscope.UV_PRESETS_FILE = str(scratch / "endoscope_uv_presets.json")
+    endoscope.UV_MEDIA_ROOT = str(scratch / "media")
+    endoscope.uv_find_export_dir = lambda **kw: (
+        str(scratch / endoscope.UV_EXPORT_DIRNAME), False)
 
     link = FakeVideoLink(args.video, size=(sw, sh)).start()
     app_args = make_args(windowed=True)
