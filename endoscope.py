@@ -93,6 +93,7 @@ import struct
 import sys
 import threading
 import time
+import traceback
 import zlib
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlsplit
@@ -3475,6 +3476,17 @@ class UVProcessor:
         return out, info
 
 
+# Live-view UV options (UV-PORT-PLAN.md §0 D3/D7, §3.5): the three bottom-bar
+# toggles, remembered in cfg["uv"]. These are the first-ever values; after
+# that the operator's last choice wins. UV mode itself is never remembered --
+# the app always boots into the plain 6.1.0 picture.
+UV_OPT_DEFAULTS = {"boost": True, "boxes": True, "filter": False}
+UV_ERROR_EVERY_S = 10.0     # §3.1: one UV error toast/traceback per 10 s, not 25/s
+UV_SLOW_MS = 35.0           # §3.8 perf guard: a frame slower than this ...
+UV_SLOW_FRAMES = 10         # ... this many times in a row -> analyse at 320 wide
+UV_STALE_S = 0.5            # video older than this: the tracked boxes are history
+
+
 # ------------------------------------------------------------- application
 
 def _screen_imu_settings(cfg, args):
@@ -3550,6 +3562,38 @@ class App:
         self.video_flip_v = bool(self.cfg.get("video_flip_v", False))
         self.video_flip_h_btn = None
         self.video_flip_v_btn = None
+        # UV fluorescence mode (6.2.0). Always boots OFF (D7): whatever was on
+        # when the device was last switched off, the operator first gets the
+        # plain picture. Only the three bar toggles are remembered, and a
+        # hand-edited or damaged value falls back to its default.
+        self.uv_mode = False
+        saved_uv = self.cfg.get("uv")
+        saved_uv = saved_uv if isinstance(saved_uv, dict) else {}
+        self.uv_opts = {}
+        for key, default in UV_OPT_DEFAULTS.items():
+            try:
+                self.uv_opts[key] = _uv_bool(saved_uv.get(key, default))
+            except (TypeError, ValueError, OverflowError):
+                self.uv_opts[key] = default
+        self.cfg["uv"] = dict(self.uv_opts)
+        # Release builds set this false to hide the tuning drawer (D10).
+        self.cfg.setdefault("uv_tuning_panel", True)
+        try:
+            self.uv_tuning_panel = _uv_bool(self.cfg["uv_tuning_panel"])
+        except (TypeError, ValueError, OverflowError):
+            self.uv_tuning_panel = True
+        self.uv_drawer_open = False
+        self.uv_mode_btn = None
+        self.uv_bar = []                # [(name, x0, y0, x1, y1, text item)] in UV RUN
+        self.uv_bar_box = None          # the bar's whole backdrop rectangle
+        self._uv_shape = None           # frame size the tracked boxes belong to
+        self._uv_gen = None             # link generation they belong to
+        self._uv_stale = False
+        self._uv_slow_run = 0           # consecutive frames over UV_SLOW_MS
+        self._uv_slow = False           # perf guard tripped: analyse at 320 wide
+        self._uv_err_t = -1e9           # monotonic time of the last error report
+        self.uv_proc = UVProcessor(self._uv_base_params())
+        self._uv_apply_opts()
         # Up/down polarity, set once with FLIP U/D and never touched
         # by zeroing or by the axis detector.
         self.el_sign = 1.0 if self.cfg.get("el_sign", 1) > 0 else -1.0
@@ -3658,6 +3702,11 @@ class App:
         self.canvas = tk.Canvas(self.root, width=self.W, height=self.H,
                                 bg=BG, highlightthickness=0, bd=0)
         self.canvas.pack(fill="both", expand=True)
+        # The UV option bar has no clickable canvas items of its own (its
+        # backgrounds are painted into the video pixels), so it is hit-tested
+        # here by geometry. Its labels are deliberately NOT tag_bound as well:
+        # one tap would then toggle twice.
+        self.canvas.bind("<Button-1>", self._uv_bar_click, add="+")
 
         self.video_item = self.canvas.create_image(self.W // 2, self.H // 2)
         self.hud = []
@@ -3854,6 +3903,11 @@ class App:
         size = max(13, int(self.H / 26))
         w = self.text_w(text, size, True) + 60
         x, y = self.W / 2, self.H * 0.78
+        bar = getattr(self, "uv_bar_box", None)
+        if bar:
+            # Sit above the UV option bar, never on it: the bar must stay
+            # readable (and its ON/OFF state visible) while a toast is up.
+            y = min(y, bar[1] - size - 14 - max(6, self.H // 100))
         self.toast_items.append(self.canvas.create_rectangle(
             x - w / 2, y - size - 14, x + w / 2, y + size + 14,
             fill="#111a1f", outline=EDGE, width=1))
@@ -3893,6 +3947,9 @@ class App:
         self.nosignal = None
         self.video_flip_h_btn = None
         self.video_flip_v_btn = None
+        self.uv_mode_btn = None
+        self.uv_bar = []
+        self.uv_bar_box = None
         if stage != self.STAGE_RUN:
             self.canvas.itemconfigure(self.video_item, image="")
             self.photo = None
@@ -4262,8 +4319,14 @@ class App:
         self.video_flip_v_btn = self.button(
             pad, flip_y, "FLIP U/D", "#2e7d32" if self.video_flip_v else "#455a64",
             self.toggle_video_flip_v, flip_size, store=self.hud, anchor="nw")[:2]
-        self.button(W - pad, H - pad, "ZERO", "#1565c0", self.zero_inplace,
-                    bs, store=self.hud, anchor="se")
+        # UV fluorescence mode: purple while on; tapping it again leaves.
+        flip_y += flip_size * 2 + 30 + max(8, H // 100)
+        self.uv_mode_btn = self.button(
+            pad, flip_y, "UV MODE", "#7b1fa2" if self.uv_mode else "#455a64",
+            self.toggle_uv_mode, flip_size, store=self.hud, anchor="nw")[:2]
+        zero_w = self.button(W - pad, H - pad, "ZERO", "#1565c0",
+                             self.zero_inplace, bs, store=self.hud,
+                             anchor="se")[2]
         if self.args.legacy_colour_tools and not self.clean_video:
             self.button(pad, H - pad - int(H * 0.055), "COLOR", "#455a64",
                         self.cycle_colour, max(10, int(H / 38)),
@@ -4304,6 +4367,247 @@ class App:
                                       font=self.f(max(15, int(H / 20)), True),
                                       state="hidden")
         self.hud.append(self.nosignal)
+        if self.uv_mode:
+            self._uv_build_bar(pad, zero_w)
+
+    # ---- UV fluorescence mode (UV-PORT-PLAN.md §3.3-§3.5, §3.8)
+
+    def _uv_base_params(self):
+        """The UV parameters the bottom-bar toggles are layered on. Item-5
+        hook: the tuning drawer makes this return the active preset."""
+        return UVParams()
+
+    def _video_rect(self):
+        """(centre x, centre y, width, height) the live picture is fitted
+        into. Item-5 hook: an open tuning drawer narrows it so the whole
+        picture stays visible beside the drawer."""
+        return self.W // 2, self.H // 2, self.W, self.H
+
+    def _uv_apply_opts(self):
+        """Push the three bar toggles into the processor. Detection runs
+        whenever anything needs its regions: BOOST recolours them, SMART BOX
+        outlines them."""
+        p = self._uv_base_params().copy()
+        p.filter_enabled = self.uv_opts["filter"]
+        p.boost_enabled = self.uv_opts["boost"]
+        p.draw_boxes = self.uv_opts["boxes"]
+        p.detect_enabled = self.uv_opts["boost"] or self.uv_opts["boxes"]
+        if self._uv_slow and (not p.analysis_width or p.analysis_width > 320):
+            p.analysis_width = 320      # the perf guard outlives a toggle
+        self.uv_proc.set_params(p)
+        self.uv_proc.reset()
+
+    def _uv_label(self, name, on=None):
+        text = {"boost": "BOOST", "boxes": "SMART BOX", "filter": "FILTER",
+                "exit": "EXIT UV"}[name]
+        if name == "exit":
+            return text
+        if on is None:
+            on = self.uv_opts[name]
+        # The check mark carries the state for anyone who cannot tell the
+        # green from the grey, and when there is no picture behind the bar.
+        return "✓ " + text if on else text
+
+    def _uv_build_bar(self, pad, zero_w):
+        """
+        Lay out the UV option bar along the bottom, centred on the picture,
+        above the status line and clear of ZERO. Only the labels are canvas
+        items: a Tk canvas cannot draw a see-through rectangle, so the button
+        backgrounds are blended into the video pixels by _uv_paint_bar --
+        that is what keeps the picture visible through the bar.
+        """
+        W, H = self.W, self.H
+        cx = self._video_rect()[0]
+        gap = max(6, H // 100)
+        bottom = H - pad - self.font_obj(max(8, H // 62)).metrics("linespace") - gap
+        half = min(cx - pad, W - pad - zero_w - gap - cx)
+        names = ("boost", "boxes", "filter", "exit")
+        # Widths are measured WITH the check mark so the buttons never move
+        # when one is toggled. Start at the MIRROR/FLIP size and shrink the
+        # padding, then the font, until the bar fits a narrow screen.
+        size0 = max(10, int(H / 38))
+        tries = [(size0, p) for p in (26, 20, 14)]
+        tries += [(s, 12) for s in range(size0 - 1, 7, -1)]
+        for size, pad_x in tries:
+            inner = max(4, size // 3)
+            widths = [self.text_w(self._uv_label(n, True), size, True) + pad_x * 2
+                      for n in names]
+            total = sum(widths) + gap * (len(names) - 1) + inner * 2
+            if total <= 2 * half:
+                break
+        bh = size * 2 + 30
+        x = int(round(cx - total / 2.0))
+        y1 = int(bottom)
+        self.uv_bar_box = (x, y1 - bh - inner * 2, x + total, y1)
+        x += inner
+        for name, w in zip(names, widths):
+            bx0, by0, bx1, by1 = x, y1 - inner - bh, x + w, y1 - inner
+            t = self.canvas.create_text((bx0 + bx1) / 2.0, (by0 + by1) / 2.0,
+                                        text=self._uv_label(name),
+                                        fill="white", font=self.f(size, True))
+            self.hud.append(t)
+            self.uv_bar.append((name, bx0, by0, bx1, by1, t))
+            x = bx1 + gap
+
+    def _uv_paint_bar(self, small, vx, vy):
+        """Blend the bar's backgrounds into the displayed image where the
+        picture lies under them (alpha keeps the picture readable through)."""
+        if not self.uv_bar_box:
+            return
+        ih, iw = small.shape[:2]
+        left, top = vx - iw // 2, vy - ih // 2      # Tk's anchor=center rule
+
+        def blend(rect, bgr, alpha):
+            x0, y0 = max(0, rect[0] - left), max(0, rect[1] - top)
+            x1, y1 = min(iw, rect[2] - left), min(ih, rect[3] - top)
+            if x1 <= x0 or y1 <= y0:
+                return
+            roi = small[y0:y1, x0:x1]
+            roi[...] = (roi.astype(np.float32) * (1.0 - alpha)
+                        + np.array(bgr, np.float32) * alpha + 0.5).astype(np.uint8)
+
+        blend(self.uv_bar_box, (0, 0, 0), 0.25)
+        for name, x0, y0, x1, y1, _ in self.uv_bar:
+            if name == "exit":
+                bgr, alpha = (0x28, 0x28, 0xc6), 0.60            # #c62828
+            elif self.uv_opts[name]:
+                bgr, alpha = (0x32, 0x7d, 0x2e), 0.60            # #2e7d32
+            else:
+                bgr, alpha = (0x64, 0x5a, 0x45), 0.45            # #455a64
+            blend((x0, y0, x1, y1), bgr, alpha)
+
+    def _uv_draw_regions(self, small, info, frame_shape):
+        """SMART BOX: outline the tracked regions at DISPLAY resolution, so a
+        one-pixel line stays one crisp pixel instead of a smeared upscale."""
+        p = self.uv_proc.params
+        fh, fw = frame_shape
+        ih, iw = small.shape[:2]
+        sx, sy = iw / float(fw), ih / float(fh)
+        colour = tuple(int(c) for c in p.box_bgr)
+        th = max(1, int(round(p.box_thickness * min(ih, iw)
+                              / float(UV_REF_SHORT_SIDE))))
+        if p.draw_contours and info.get("contours"):
+            k = np.array([sx, sy], np.float32)
+            cv2.drawContours(small, [np.round(c.astype(np.float32) * k)
+                                     .astype(np.int32)
+                                     for c in info["contours"]],
+                             -1, colour, 1, cv2.LINE_AA)
+        fs = max(0.34, iw / 1700.0)
+        for region in info.get("regions", ()):
+            x, y, w, h = region["box"]
+            X0, Y0 = int(round(x * sx)), int(round(y * sy))
+            X1, Y1 = int(round((x + w) * sx)), int(round((y + h) * sy))
+            cv2.rectangle(small, (X0, Y0), (X1, Y1), colour, th, cv2.LINE_AA)
+            if p.show_labels:
+                tid, pct = region["id"], region["percent"]
+                text = "#%d %.2f%%" % (tid, pct) if tid else "%.2f%%" % pct
+                (tw, tht), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX,
+                                               fs, 1)
+                ly = Y0 - 4 if Y0 - tht - 6 >= 0 else Y1 + tht + 6
+                lx = min(X0, iw - tw - 6)
+                cv2.rectangle(small, (lx, ly - tht - 4), (lx + tw + 6, ly + 3),
+                              colour, -1)
+                cv2.putText(small, text, (lx + 3, ly), cv2.FONT_HERSHEY_SIMPLEX,
+                            fs, (0, 0, 0), 1, cv2.LINE_AA)
+
+    def _uv_error(self):
+        """§3.1: report a UV failure without flooding the log or the screen
+        at 25 frames a second. The caller shows the unprocessed frame."""
+        now = time.monotonic()
+        if now - self._uv_err_t < UV_ERROR_EVERY_S:
+            return
+        self._uv_err_t = now
+        traceback.print_exc()
+        self.toast("UV PROCESSING ERROR", WARN, ms=2000)
+
+    def _uv_process(self, frame):
+        """Filter / detect / boost one oriented capture-size frame.
+        Returns (frame to show, info), or (frame, None) on any failure."""
+        try:
+            if frame.shape[:2] != self._uv_shape:
+                self._uv_shape = frame.shape[:2]
+                self.uv_proc.reset()    # old boxes are in the old size's pixels
+            out, info = self.uv_proc.process(frame, draw=False)
+            self._uv_perf_guard(info.get("ms", 0.0))
+            return out, info
+        except Exception:
+            self._uv_error()
+            return frame, None
+
+    def _uv_overlay(self, small, info, frame_shape, unprocessed, vx, vy):
+        """Boxes plus bar backgrounds on the display-size image. On failure
+        the plain, unprocessed frame is shown for this tick instead."""
+        try:
+            small = np.ascontiguousarray(small)     # cv2 drawing needs this
+            if info and self.uv_opts["boxes"]:
+                self._uv_draw_regions(small, info, frame_shape)
+            self._uv_paint_bar(small, vx, vy)
+            return small
+        except Exception:
+            self._uv_error()
+            ih, iw = small.shape[:2]
+            return cv2.resize(unprocessed, (iw, ih),
+                              interpolation=cv2.INTER_LINEAR)
+
+    def _uv_perf_guard(self, ms):
+        """§3.8: if the Pi cannot keep up, analyse at 320 wide from now on."""
+        if self._uv_slow:
+            return
+        self._uv_slow_run = self._uv_slow_run + 1 if ms > UV_SLOW_MS else 0
+        if self._uv_slow_run >= UV_SLOW_FRAMES:
+            self._uv_slow = True
+            if (not self.uv_proc.params.analysis_width
+                    or self.uv_proc.params.analysis_width > 320):
+                self.uv_proc.update(analysis_width=320)
+                self.uv_proc.reset()    # tracked boxes are analysis pixels
+            print("endoscope: UV processing over {:.0f} ms for {} frames; "
+                  "analysing at 320 px wide".format(UV_SLOW_MS, UV_SLOW_FRAMES),
+                  file=sys.stderr)
+
+    def _uv_watch(self, h):
+        """Forget tracked boxes when they no longer describe the picture: a
+        probe restart, or video that stopped long enough to move the lens."""
+        stale = h.get("frame_age", 0.0) > UV_STALE_S
+        if h.get("generation") != self._uv_gen or (stale and not self._uv_stale):
+            self.uv_proc.reset()
+        self._uv_gen = h.get("generation")
+        self._uv_stale = stale
+
+    def _uv_bar_click(self, event):
+        if self.stage != self.STAGE_RUN or not self.uv_mode:
+            return
+        for name, x0, y0, x1, y1, _ in self.uv_bar:
+            if x0 <= event.x < x1 and y0 <= event.y < y1:
+                if name == "exit":
+                    self.toggle_uv_mode()
+                else:
+                    self.uv_toggle(name)
+                return
+
+    def toggle_uv_mode(self):
+        self.uv_mode = not self.uv_mode
+        if self.uv_mode:
+            self._uv_apply_opts()       # last toggles, fresh tracker
+            self._uv_shape = None
+        else:
+            self.uv_drawer_open = False
+        self.last_seq = -1
+        if self.stage == self.STAGE_RUN:
+            self.set_stage(self.STAGE_RUN)  # rebuilds the button and the bar
+        self.toast("UV MODE: " + ("ON" if self.uv_mode else "OFF"), OK, ms=1200)
+
+    def uv_toggle(self, name):
+        if name not in UV_OPT_DEFAULTS:
+            return
+        self.uv_opts[name] = not self.uv_opts[name]
+        self.cfg["uv"] = dict(self.uv_opts)
+        self.save_cfg()
+        self._uv_apply_opts()
+        self.last_seq = -1              # repaint the bar backgrounds now
+        for n, _, _, _, _, t in self.uv_bar:
+            self.canvas.itemconfigure(t, text=self._uv_label(n))
+        self.toast(self._uv_label(name, False) + ": "
+                   + ("ON" if self.uv_opts[name] else "OFF"), OK, ms=1200)
 
     def _apply_video_orientation(self, image):
         """Apply display-only orientation without touching IMU coordinates."""
@@ -4499,6 +4803,8 @@ class App:
             self.toggle_video_flip_h()
         elif k == "v" and self.stage == self.STAGE_RUN:
             self.toggle_video_flip_v()
+        elif k == "u" and self.stage == self.STAGE_RUN:
+            self.toggle_uv_mode()
         elif k == "d" and self.stage == self.STAGE_RUN:
             self.toggle_diag()
         elif k == "n" and self.stage == self.STAGE_RUN:
@@ -4769,17 +5075,26 @@ class App:
                         self.toast("DIAG scored \u2014 press DIAG to leave",
                                    OK, ms=3000)
 
+            if self.uv_mode:
+                self._uv_watch(h)
             show = self.diag_photo if self.diag_photo is not None else frame
             fresh = (self.diag_photo is not None) or (frame is not None
                                                       and seq != self.last_seq)
             if show is not None and fresh:
                 self.last_seq = seq
+                uv_live = self.uv_mode and self.diag_photo is None
+                uv_info = None
                 if self.diag_photo is None:
                     # Video orientation is display-only. DIAG intentionally
                     # stays unmodified so it always shows sensor truth.
                     show = self._apply_video_orientation(show)
+                    if uv_live:
+                        # Analysed at capture resolution, before the resize.
+                        unprocessed = show
+                        show, uv_info = self._uv_process(show)
                 fh, fw = show.shape[:2]
-                scale = min(self.W / fw, self.H / fh)
+                vx, vy, vw, vh = self._video_rect()
+                scale = min(vw / fw, vh / fh)
                 small = cv2.resize(show, (int(fw * scale), int(fh * scale)),
                                    interpolation=cv2.INTER_LINEAR)
                 if self.swap_rb and self.diag_photo is None and not uvc:
@@ -4790,8 +5105,14 @@ class App:
                     small = self._pi_colour(small)
                 if self.awb and self.diag_photo is None and not uvc:
                     small, self._awb_gains = grey_world(small, self._awb_gains)
+                if uv_live:
+                    # Boxes and the see-through bar go on at display size,
+                    # after any colour correction, so neither is recoloured.
+                    small = self._uv_overlay(small, uv_info, (fh, fw),
+                                             unprocessed, vx, vy)
                 rgb = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
                 self.photo = ImageTk.PhotoImage(Image.fromarray(rgb))
+                self.canvas.coords(self.video_item, vx, vy)
                 self.canvas.itemconfigure(self.video_item, image=self.photo)
                 self.canvas.tag_lower(self.video_item)
                 for i in self.hud:
@@ -4820,6 +5141,8 @@ class App:
                 bits.append("MIRROR")
             if self.video_flip_v:
                 bits.append("V-FLIP")
+            if self.uv_mode:
+                bits.append("UV")
             if getattr(self.link, "is_usb_composite", False):
                 bits.append("USB UVC+IMU")
                 if h.get("camera_reconnects"):
