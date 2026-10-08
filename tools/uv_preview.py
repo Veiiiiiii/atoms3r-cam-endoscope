@@ -283,19 +283,16 @@ def _center_crop_4x3(frame):
 
 
 def make_args(windowed=True):
-    """Every attribute App (and the helpers it calls, e.g.
-    _screen_imu_settings) reads off args -- see endoscope.py App.__init__,
-    App.update and _screen_imu_settings. A plain Namespace stands in for
-    argparse's result; App never mutates it."""
+    """Every attribute App (and the helpers it calls) reads off args -- see
+    endoscope.py App.__init__ and App.update. A plain Namespace stands in
+    for argparse's result; App never mutates it. This branch is 6.0.4 +
+    UV only (no screen gyro), so there are no screen_imu_* attributes."""
     return argparse.Namespace(
         windowed=windowed,
         kiosk=False,
         video_only=True,
         legacy_colour_tools=False,
         log=None,
-        no_screen_imu=True,
-        screen_imu_port=None,
-        screen_imu_sign=None,
         sim=False,
         port=None,
         baud=115200,

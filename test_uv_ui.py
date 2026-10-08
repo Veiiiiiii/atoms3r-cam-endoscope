@@ -8,9 +8,12 @@ exits 0 when there is none). No camera/serial device is used: a static-frame
 fake link feeds the real App, and endoscope.CONFIG always points at a temp
 file -- the operator's ~/.config/endoscope.json is never touched.
 
-The UV-OFF identity check loads the field-approved 6.1.0 endoscope.py
-straight out of git (commit 0372214) and compares the exact array handed to
-Image.fromarray against this file's App for the same synthetic frame.
+The UV-OFF identity check loads the field-approved 6.0.4 endoscope.py --
+the build actually running on the owner's Pi -- straight out of git
+(commit 38500b5) and compares the exact array handed to Image.fromarray
+against this file's App for the same synthetic frame. (This branch has no
+screen gyro: 6.1.0's screen-mounted-gyro feature and its own UV+screen-gyro
+build, 6.2.0, live on branch `uv-mode-screengyro` instead.)
 """
 import argparse
 import contextlib
@@ -32,7 +35,7 @@ import numpy as np
 import PIL.Image
 
 HERE = Path(__file__).resolve().parent
-PRISTINE_610 = "0372214"
+PRISTINE_604 = "38500b5"
 TMP = Path(tempfile.mkdtemp(prefix="test_uv_ui_"))
 
 
@@ -62,7 +65,7 @@ def load_module(path, name):
     spec.loader.exec_module(module)
     module.CONFIG = str(TMP / (name + ".json"))
     # The tuning drawer's presets file and EXPORT never touch the real home
-    # folder or a real USB stick either (6.1.0 has neither, hence getattr).
+    # folder or a real USB stick either (6.0.4 has neither, hence getattr).
     if hasattr(module, "UV_PRESETS_FILE"):
         module.UV_PRESETS_FILE = str(TMP / (name + "_uv_presets.json"))
         module.UV_MEDIA_ROOT = str(TMP / "no_media")
@@ -70,17 +73,17 @@ def load_module(path, name):
     return module
 
 
-def load_pristine_610():
-    """6.1.0's endoscope.py from git, or None if git/the commit is absent
+def load_pristine_604():
+    """6.0.4's endoscope.py from git, or None if git/the commit is absent
     (e.g. a deployed package without .git)."""
     try:
-        src = subprocess.run(["git", "show", PRISTINE_610 + ":endoscope.py"],
+        src = subprocess.run(["git", "show", PRISTINE_604 + ":endoscope.py"],
                              cwd=str(HERE), capture_output=True, check=True).stdout
     except (OSError, subprocess.CalledProcessError):
         return None
-    path = TMP / "endoscope_610.py"
+    path = TMP / "endoscope_604.py"
     path.write_bytes(src)
-    return load_module(path, "endoscope_610")
+    return load_module(path, "endoscope_604")
 
 
 class ImageSpy:
@@ -148,7 +151,7 @@ class StaticLink:
 def make_args():
     return argparse.Namespace(
         windowed=True, kiosk=False, video_only=True, legacy_colour_tools=False,
-        log=None, no_screen_imu=True, screen_imu_port=None, screen_imu_sign=None,
+        log=None,
         sim=False, port=None, baud=115200, video=None, video_size="320x240",
         official=False, usb_composite=False,
         imu_ws="ws://192.168.4.1/api/v1/ws/imu_data")
@@ -239,18 +242,18 @@ def text_item(app, text):
 
 # --------------------------------------------------------------- tests
 def test_uv_off_identity(new, old):
-    """(a) UV OFF: the displayed array and its placement match 6.1.0 exactly."""
+    """(a) UV OFF: the displayed array and its placement match 6.0.4 exactly."""
     if old is None:
-        print("SKIPPED: UV-OFF IDENTITY (git or commit {} not available)".format(PRISTINE_610))
+        print("SKIPPED: UV-OFF IDENTITY (git or commit {} not available)".format(PRISTINE_604))
         return
     frames = [scene(), scene(480, 640, seed=3)]
     for geometry in ((1024, 600), (800, 480)):
         results = {}
-        for label, mod in (("6.1.0", old), ("6.2.0", new)):
+        for label, mod in (("6.0.4", old), ("6.0.5", new)):
             app, link, spy = make_app(mod, frames[0])
             try:
                 resize_to(app, *geometry)
-                if label == "6.2.0":
+                if label == "6.0.5":
                     # Having used UV mode and left it must not leave a trace.
                     app.toggle_uv_mode()
                     tick(app, link)
@@ -266,11 +269,11 @@ def test_uv_off_identity(new, old):
                 results[label] = out
             finally:
                 close(app)
-        for (a, pa, sa), (b, pb, sb) in zip(results["6.1.0"], results["6.2.0"]):
+        for (a, pa, sa), (b, pb, sb) in zip(results["6.0.4"], results["6.0.5"]):
             assert sa == sb, (sa, sb)
             assert pa == pb, (pa, pb)
-            assert a.shape == b.shape and np.array_equal(a, b), "UV-off pixels differ from 6.1.0"
-    print("PASS: UV-OFF IDENTITY -- displayed arrays and placement == 6.1.0 at 1024x600 and "
+            assert a.shape == b.shape and np.array_equal(a, b), "UV-off pixels differ from 6.0.4"
+    print("PASS: UV-OFF IDENTITY -- displayed arrays and placement == 6.0.4 at 1024x600 and "
           "800x480, plain and mirrored, 320x240 and 640x480, also after a UV on/off round trip")
 
 
@@ -1521,7 +1524,7 @@ def main():
         print("SKIPPED: test_uv_ui.py needs a display for Tk ({})".format(exc))
         return
     new = load_module(HERE / "endoscope.py", "endoscope_uv_ui_test")
-    old = load_pristine_610()
+    old = load_pristine_604()
     test_uv_off_identity(new, old)
     test_mode_toggle(new)
     test_toggles_persist(new)
