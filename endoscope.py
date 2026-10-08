@@ -3144,9 +3144,13 @@ def uv_presets_load(path):
     """Read the presets file into {"version", "active", "presets"}. Never
     raises: a missing, unreadable or hand-mangled file just means "no saved
     presets, FACTORY active", and a bad entry is dropped on its own instead
-    of taking the good ones with it. Saved presets come back newest first,
-    their params already cleaned by UVParams.from_dict (so a NaN or an
-    out-of-range value in the file is factory/clamped from here on)."""
+    of taking the good ones with it. Saved presets come back in file order
+    (R4: SAVE already writes the newest one first, so this is newest-first
+    too -- re-sorting here by "created" is what is dropped, because an
+    offline Pi's clock can jump backwards and silently reorder every
+    existing preset on the next load). Their params are already cleaned by
+    UVParams.from_dict (so a NaN or an out-of-range value in the file is
+    factory/clamped from here on)."""
     data = {"version": 1, "active": UV_FACTORY_ID, "presets": []}
     try:
         with open(path, encoding="utf-8") as f:
@@ -3171,17 +3175,20 @@ def uv_presets_load(path):
             "id": pid, "name": name.strip()[:40],
             "created": created if isinstance(created, str) else "",
             "params": _uv_params_json(UVParams.from_dict(params))})
-    # ISO timestamps sort as text; sorted() is stable for equal/blank ones.
-    data["presets"].sort(key=lambda p: p["created"], reverse=True)
     if raw.get("active") in seen:
         data["active"] = raw["active"]
     return data
 
 
-def _uv_write_json(path, obj):
+def _uv_write_json(path, obj, fsync=True):
     """Write JSON so that a power cut leaves either the old file or the new
     one, never half of each: write a temp file in the same directory, push
-    it to the disk, then rename it over the target in one step."""
+    it to the disk, then rename it over the target in one step.
+    fsync=False skips the per-file fsync (R1): uv_export writes several
+    small files per tap and a fsync each -- often a real disk wait -- adds
+    up to a freeze; os.replace() alone still keeps one file or the other
+    whole, just without the "flushed before the rename" guarantee, which a
+    one-off exported preset copy does not need."""
     folder = os.path.dirname(os.path.abspath(path))
     os.makedirs(folder, exist_ok=True)
     tmp = "{}.{}.tmp".format(path, os.getpid())
@@ -3189,7 +3196,8 @@ def _uv_write_json(path, obj):
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(obj, f, indent=1, allow_nan=False)
             f.flush()
-            os.fsync(f.fileno())
+            if fsync:
+                os.fsync(f.fileno())
         os.replace(tmp, path)
     except BaseException:
         try:
@@ -3241,27 +3249,50 @@ def uv_preset_id(now, existing_ids):
     return pid
 
 
+def _uv_first_mounted(parent):
+    """First writable mounted dir directly inside parent, else None."""
+    try:
+        names = sorted(os.listdir(parent))
+    except OSError:
+        return None
+    for name in names:
+        cand = os.path.join(parent, name)
+        try:
+            if (os.path.isdir(cand) and os.path.ismount(cand)
+                    and os.access(cand, os.W_OK)):
+                return cand
+        except OSError:
+            continue
+    return None
+
+
 def uv_find_export_dir(home=None, media_root=UV_MEDIA_ROOT, user=None):
-    """D12: where EXPORT writes. The first writable mounted USB stick --
-    Raspberry Pi OS mounts them at /media/<user>/<label>; a bare
-    /media/<label> is checked too -- gets <stick>/Endoscope_UV_presets.
+    """D12/R2: where EXPORT writes. Raspberry Pi OS mounts a USB stick at
+    /media/<user>/<label>, which is tried first; but the app can be running
+    as a different effective user (root via systemd, or a desktop test as
+    someone else), so every other /media/<name>/<label> is tried next; a
+    bare /media/<label> some distros use instead is tried last. The first
+    writable mounted candidate wins -- gets <stick>/Endoscope_UV_presets.
     With no stick it goes to ~/Endoscope_UV_presets. Returns (dir, is_usb)."""
     home = home or os.path.expanduser("~")
     user = (user or os.environ.get("USER") or os.environ.get("LOGNAME")
             or os.path.basename(os.path.normpath(home)))
-    for parent in (os.path.join(media_root, user), media_root):
+    user_dir = os.path.join(media_root, user)
+    found = _uv_first_mounted(user_dir)
+    if found is None:
         try:
-            names = sorted(os.listdir(parent))
+            others = [n for n in sorted(os.listdir(media_root))
+                     if os.path.join(media_root, n) != user_dir]
         except OSError:
-            continue
-        for name in names:
-            cand = os.path.join(parent, name)
-            try:
-                if (os.path.isdir(cand) and os.path.ismount(cand)
-                        and os.access(cand, os.W_OK)):
-                    return os.path.join(cand, UV_EXPORT_DIRNAME), True
-            except OSError:
-                continue
+            others = []
+        for name in others:
+            found = _uv_first_mounted(os.path.join(media_root, name))
+            if found is not None:
+                break
+    if found is None:
+        found = _uv_first_mounted(media_root)
+    if found is not None:
+        return os.path.join(found, UV_EXPORT_DIRNAME), True
     return os.path.join(home, UV_EXPORT_DIRNAME), False
 
 
@@ -3277,7 +3308,11 @@ def uv_export(dest_dir, presets, toggles, now=None, sync=False):
     live bar toggles (so UVScope shows what the operator was looking at),
     plus three extra keys UVScope ignores. Raises OSError on failure; the
     caller reports it. sync=True (a USB stick) flushes the kernel's write
-    cache, so pulling the stick right after the toast loses nothing."""
+    cache, so pulling the stick right after the toast loses nothing.
+    R1: individual files skip their own fsync (a preset count times a sync
+    disk wait is what froze the UI); the single os.sync() at the end still
+    flushes everything written here before the toast says it is safe to
+    pull the stick."""
     tm = _uv_localtime(now)
     stamp_min = time.strftime("%Y%m%d-%H%M", tm)
     stamp_sec = time.strftime("%Y%m%d-%H%M%S", tm)
@@ -3303,7 +3338,7 @@ def uv_export(dest_dir, presets, toggles, now=None, sync=False):
             n += 1
         used.add(fname)
         path = os.path.join(dest_dir, fname)
-        _uv_write_json(path, d)
+        _uv_write_json(path, d, fsync=False)
         written.append(path)
         bundle.append(d)
     path = os.path.join(dest_dir, "uv_presets_all_{}.json".format(stamp_sec))
@@ -3312,7 +3347,7 @@ def uv_export(dest_dir, presets, toggles, now=None, sync=False):
                           "ref_short_side": UV_REF_SHORT_SIDE,
                           "toggles": {"boost": boost, "boxes": boxes,
                                       "filter": filt},
-                          "presets": bundle})
+                          "presets": bundle}, fsync=False)
     written.append(path)
     if sync and hasattr(os, "sync"):
         os.sync()
@@ -3360,6 +3395,12 @@ UV_BOX_COLOURS = [("Magenta", (255, 0, 255)), ("Green", (0, 255, 0)),
                   ("Red", (0, 0, 255)), ("White", (255, 255, 255))]
 UV_DRAG_SLOP = 8                # px a finger may wander before a tap is a drag
 UV_DELETE_CONFIRM_S = 3.0
+# R6: the tuning drawer's visibility default (D10) lives here, not frozen
+# into every saved config by a setdefault at boot -- a release build flips
+# this one constant to False and that alone hides the drawer for anyone who
+# never touched the "uv_tuning_panel" key, including configs saved by an
+# earlier, test-version build.
+UV_TUNING_PANEL_DEFAULT = True
 
 
 # Live-view UV options (UV-PORT-PLAN.md §0 D3/D7, §3.5): the three bottom-bar
@@ -3422,12 +3463,16 @@ class App:
             except (TypeError, ValueError, OverflowError):
                 self.uv_opts[key] = default
         self.cfg["uv"] = dict(self.uv_opts)
-        # Release builds set this false to hide the tuning drawer (D10).
-        self.cfg.setdefault("uv_tuning_panel", True)
+        # R6: read with .get(..., UV_TUNING_PANEL_DEFAULT), no setdefault --
+        # a setdefault would freeze today's True into self.cfg (and so into
+        # the next save_cfg) for every config that never set the key, and a
+        # later release build flipping the module constant to False would
+        # then have no effect on an installed Pi's existing config file.
         try:
-            self.uv_tuning_panel = _uv_bool(self.cfg["uv_tuning_panel"])
+            self.uv_tuning_panel = _uv_bool(
+                self.cfg.get("uv_tuning_panel", UV_TUNING_PANEL_DEFAULT))
         except (TypeError, ValueError, OverflowError):
-            self.uv_tuning_panel = True
+            self.uv_tuning_panel = UV_TUNING_PANEL_DEFAULT
         self.uv_drawer_open = False     # never persisted: boots closed
         # Tuning presets (D11). The active preset survives a restart; unsaved
         # drawer edits live only in self.uv_work and are dropped on a preset
@@ -3452,6 +3497,7 @@ class App:
         self._uv_hpress = None
         self._uv_del_until = 0.0        # DELETE armed ("CONFIRM?") until then
         self._uv_del_after = None
+        self._uv_export_busy = False    # R1: EXPORT's worker thread running
         self._uv_ms = None              # last UV processing time
         self._uv_ms_t = 0.0
         self._uv_bar_state = "normal"
@@ -3584,6 +3630,13 @@ class App:
         self.video_item = self.canvas.create_image(self.W // 2, self.H // 2)
         self.hud = []
         self.stage_items = []
+        # R5: (item, funcid) pairs from button()/_uv_build_tab's tag_bind,
+        # unbound in set_stage before their items are deleted -- Tcl never
+        # frees a tag_bind callback command just because its item was
+        # deleted, so a rebuild-heavy screen (every UV toggle, every drawer
+        # open/close goes through set_stage) leaked one per button per
+        # rebuild and slowly wedged Tcl's command table.
+        self._item_binds = []
         self.indicator = None
         self.readout = None
         self.statusbar = None
@@ -3658,23 +3711,32 @@ class App:
 
     def save_cfg(self):
         try:
-            os.makedirs(os.path.dirname(CONFIG), exist_ok=True)
-            with open(CONFIG, "w", encoding="utf-8") as f:
-                json.dump({"config_rev": CONFIG_REV,
-                           "axis": self.axis_idx,
-                           "rot180": self.rot180,
-                           "video_flip_h": self.video_flip_h,
-                           "video_flip_v": self.video_flip_v,
-                           "el_sign": self.el_sign,
-                           "awb": self.awb,
-                           "swap_rb": self.swap_rb,
-                           "tune": self.tune_saved,
-                           "cal": {"gains": self.pi_gains, "chan": self.pi_chan,
-                                   "bright": self.pi_bright, "sat": self.pi_sat,
-                                   "black": self.pi_black,
-                                   "white": self.pi_white,
-                                   "gamma": self.pi_gamma,
-                                   "matrix": self.pi_matrix}}, f)
+            # Start from the existing cfg dict (not a bare literal) so keys
+            # this method doesn't know about -- notably the UV toggles in
+            # cfg["uv"] -- survive a save instead of being dropped.
+            out = dict(self.cfg)
+            out.update({"config_rev": CONFIG_REV,
+                        "axis": self.axis_idx,
+                        "rot180": self.rot180,
+                        "video_flip_h": self.video_flip_h,
+                        "video_flip_v": self.video_flip_v,
+                        "el_sign": self.el_sign,
+                        "awb": self.awb,
+                        "swap_rb": self.swap_rb,
+                        "tune": self.tune_saved,
+                        "cal": {"gains": self.pi_gains,
+                                "chan": self.pi_chan,
+                                "bright": self.pi_bright,
+                                "sat": self.pi_sat,
+                                "black": self.pi_black,
+                                "white": self.pi_white,
+                                "gamma": self.pi_gamma,
+                                "matrix": self.pi_matrix}})
+            # R3: atomic (temp file + rename) through the same helper the UV
+            # presets file uses, so a power cut mid-save can never leave a
+            # half-written endoscope.json -- the old file survives instead.
+            _uv_write_json(CONFIG, out)
+            self.cfg = out
         except Exception:
             pass
 
@@ -3746,9 +3808,10 @@ class App:
         t = self.canvas.create_text(x0 + w / 2, y0 + h / 2, text=label,
                                     fill="white", font=self.f(size, True))
         for item in (r, t):
-            self.canvas.tag_bind(item, "<Button-1>", lambda e: cb())
-        if store is not None:
-            store.extend([r, t])
+            funcid = self.canvas.tag_bind(item, "<Button-1>", lambda e: cb())
+            self._item_binds.append((item, funcid))        # R5: unbound by
+        if store is not None:                              # set_stage before
+            store.extend([r, t])                            # the item dies
         return r, t, w, h
 
     def toast(self, text, color="#ffffff", ms=900):
@@ -3792,6 +3855,17 @@ class App:
     #      screen on top of the still-visible video and HUD.
 
     def set_stage(self, stage):
+        # R5: drop every button()/_uv_build_tab tag_bind before the items
+        # they are on are deleted below -- Tcl keeps a tag_bind's callback
+        # command alive until explicitly unbound, item deletion alone does
+        # not free it, and this screen gets rebuilt (and rebinds every
+        # button) on every UV toggle and every drawer open/close.
+        for item, funcid in self._item_binds:
+            try:
+                self.canvas.tag_unbind(item, "<Button-1>", funcid)
+            except tk.TclError:
+                pass
+        self._item_binds = []
         for i in self.stage_items:
             self.canvas.delete(i)
         self.stage_items = []
@@ -4244,6 +4318,11 @@ class App:
                 break
         bh = size * 2 + 30
         x = int(round(cx - total / 2.0))
+        # R8: cx is centred on the picture, which on a small or portrait
+        # screen (640x480 with the drawer open, 480x800) can sit close
+        # enough to one edge that the centred bar runs off-screen even
+        # after the shrink loop above; pin it back inside the margins.
+        x = max(pad, min(x, W - pad - total))
         y1 = int(bottom)
         self.uv_bar_box = (x, y1 - bh - inner * 2, x + total, y1)
         # Where the picture does NOT reach under the bar (a picture shrunk
@@ -4421,6 +4500,14 @@ class App:
                 return
 
     def toggle_uv_mode(self):
+        # R7: UV processing needs clean BGR frames; the legacy serial probe
+        # sends an already-composited debug image, so entering UV on that
+        # path would run the detector/boost/filter over garbage. Only
+        # ENTERING is refused -- EXIT must always work, so a mode somehow
+        # left on from before (e.g. a link swap) is never stuck on.
+        if not self.uv_mode and not self.clean_video:
+            self.toast("UV MODE NEEDS THE USB CAMERA", WARN, ms=1800)
+            return
         self.uv_mode = not self.uv_mode
         if self.uv_mode:
             self._uv_apply_opts()       # last toggles, fresh tracker
@@ -4536,7 +4623,8 @@ class App:
                              fill="white", font=self.f(max(14, int(H / 30)), True),
                              tags="uv_tab")
         for item in (poly, text):
-            c.tag_bind(item, "<Button-1>", lambda e: self.toggle_uv_drawer())
+            funcid = c.tag_bind(item, "<Button-1>", lambda e: self.toggle_uv_drawer())
+            self._item_binds.append((item, funcid))    # R5: see button()
         self.hud.extend([poly, text])
         self.uv_tab = (x0, y0, x1, y1)
 
@@ -4721,7 +4809,13 @@ class App:
                                   tags=tag)
                     self._uv_hits.append((x0, y, x0 + bw, y + u, key, field))
                 kr = max(8, int(u * 0.3))
-                tx0, tx1 = m + bw + m + kr, w - m - bw - m - kr
+                tx0 = m + bw + m + kr
+                # R8: on a narrow drawer (small screen, panel_w floored at
+                # 300 but still tight once the -/+ buttons and knob radius
+                # are subtracted) the raw formula can put tx1 at or left of
+                # tx0, an inverted/zero-width track; keep a usable 20 px
+                # strip instead of a track a finger can no longer drag.
+                tx1 = max(w - m - bw - m - kr, tx0 + 20)
                 cy = y + u / 2.0
                 c.create_rectangle(tx0, cy - 3, tx1, cy + 3, fill="#37474f",
                                    outline="", tags=tag)
@@ -5100,17 +5194,49 @@ class App:
     def uv_preset_export(self):
         """EXPORT (D12): FACTORY plus every saved preset, as UVScope1.1
         config files, to a USB stick if one is mounted, else the home
-        folder. Unsaved edits are not a preset and are not exported."""
-        try:
-            dest, usb = uv_find_export_dir(media_root=UV_MEDIA_ROOT)
-            presets = [{"name": UV_FACTORY_NAME, "params": UVParams()}] + [
-                {"name": p["name"], "params": p["params"]}
-                for p in self.uv_presets["presets"]]
-            paths = uv_export(dest, presets, self.uv_opts, time.time(), sync=usb)
-        except Exception:
-            traceback.print_exc()
+        folder. Unsaved edits are not a preset and are not exported.
+        R1: finding the stick and writing the files can stall for real
+        (a slow/half-pulled USB stick, a network home directory) long
+        enough to freeze a touch screen, so the work itself runs on a
+        daemon thread; this method only starts it and returns at once.
+        outcome is the single handoff from that thread to _uv_export_poll,
+        passed through root.after rather than kept on self (plain dict
+        set/get is enough -- one writer, one reader, never both at once).
+        The worker touches no Tk object."""
+        if self._uv_export_busy:
+            self.toast("EXPORT BUSY", WARN, ms=1200)
+            return
+        self._uv_export_busy = True
+        self.toast("EXPORTING…", OK, ms=30000)      # replaced by the result below
+        presets = [{"name": UV_FACTORY_NAME, "params": UVParams()}] + [
+            {"name": p["name"], "params": p["params"]}
+            for p in self.uv_presets["presets"]]
+        toggles = dict(self.uv_opts)
+        outcome = {}
+
+        def worker():
+            try:
+                dest, usb = uv_find_export_dir(media_root=UV_MEDIA_ROOT)
+                paths = uv_export(dest, presets, toggles, time.time(), sync=usb)
+                outcome["ok"] = (dest, usb, paths)
+            except Exception:
+                outcome["err"] = traceback.format_exc()
+        threading.Thread(target=worker, daemon=True).start()
+        self.root.after(150, self._uv_export_poll, outcome)
+
+    def _uv_export_poll(self, outcome):
+        """Tk-thread side of EXPORT (R1): called only via root.after, so it
+        is always safe to touch the canvas/toast here. Keeps re-polling
+        every 150 ms until the worker thread fills in outcome."""
+        if "ok" not in outcome and "err" not in outcome:
+            self.root.after(150, self._uv_export_poll, outcome)
+            return
+        self._uv_export_busy = False
+        if "err" in outcome:
+            sys.stderr.write(outcome["err"])
             self.toast("EXPORT FAILED", ALERT, ms=2500)
             return
+        dest, usb, paths = outcome["ok"]
         print("endoscope: UV presets exported to {}".format(dest))
         where = (os.path.basename(os.path.dirname(dest)) + "/" if usb else "~/")
         self.toast("EXPORTED {} FILES → {}{}".format(
