@@ -126,7 +126,7 @@ from PIL import Image, ImageTk
 
 CONFIG = os.path.join(os.path.expanduser("~"), ".config", "endoscope.json")
 SYNC = b"\xa5\x5a"
-APP_VER = "6.0.4"
+APP_VER = "6.0.5"
 CONFIG_REV = 6
 
 # One running instance owns /dev/video* and /dev/ttyACM*. A second launch that
@@ -3121,7 +3121,7 @@ UV_EXPORT_DIRNAME = "Endoscope_UV_presets"
 UV_MEDIA_ROOT = "/media"        # where Raspberry Pi OS automounts USB sticks
 UV_FACTORY_ID = "factory"
 UV_FACTORY_NAME = "FACTORY"
-UV_EXPORTED_BY = "Endoscope 6.2.0"
+UV_EXPORTED_BY = "Endoscope " + APP_VER
 
 
 def _uv_localtime(now=None):
@@ -3365,7 +3365,7 @@ UV_DELETE_CONFIRM_S = 3.0
 # Live-view UV options (UV-PORT-PLAN.md §0 D3/D7, §3.5): the three bottom-bar
 # toggles, remembered in cfg["uv"]. These are the first-ever values; after
 # that the operator's last choice wins. UV mode itself is never remembered --
-# the app always boots into the plain 6.1.0 picture.
+# the app always boots into the plain 6.0.4 picture.
 UV_OPT_DEFAULTS = {"boost": True, "boxes": True, "filter": False}
 UV_ERROR_EVERY_S = 10.0     # §3.1: one UV error toast/traceback per 10 s, not 25/s
 UV_SLOW_MS = 35.0           # §3.8 perf guard: a frame slower than this ...
@@ -3408,7 +3408,7 @@ class App:
         self.video_flip_v = bool(self.cfg.get("video_flip_v", False))
         self.video_flip_h_btn = None
         self.video_flip_v_btn = None
-        # UV fluorescence mode (6.2.0). Always boots OFF (D7): whatever was on
+        # UV fluorescence mode (6.0.5). Always boots OFF (D7): whatever was on
         # when the device was last switched off, the operator first gets the
         # plain picture. Only the three bar toggles are remembered, and a
         # hand-edited or damaged value falls back to its default.
