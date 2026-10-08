@@ -3262,21 +3262,12 @@ class App:
                        and abs(self.root.winfo_rootx()) <= 3
                        and abs(self.root.winfo_rooty()) <= 3)
             if self.args.kiosk or not granted:
-                # Remap once as a managed window, then request fullscreen.
-                # Do not substitute an unmanaged borderless window.
-                self.root.withdraw()
-                self.root.overrideredirect(False)
-                self.root.attributes("-topmost", False)
                 self.root.attributes("-fullscreen", False)
-                self.root.deiconify()
-
-                def request_fullscreen():
-                    if not self._exiting:
-                        self.root.attributes("-fullscreen", True)
-                        self.root.lift()
-                        self.root.focus_force()
-
-                self.root.after(250, request_fullscreen)
+                self.root.overrideredirect(True)
+                self.root.geometry(f"{sw}x{sh}+0+0")
+                self.root.attributes("-topmost", True)
+                self.root.lift()
+                self.root.focus_force()
         except tk.TclError as exc:
             print(f"Fullscreen fallback failed: {exc}", file=sys.stderr)
 

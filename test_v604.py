@@ -16,6 +16,11 @@ def test_fullscreen():
         def attributes(self,*args): self.calls.append(('attr',args))
         def overrideredirect(self,value): self.calls.append(('borderless',value))
         def geometry(self,value): self.calls.append(('geometry',value))
+        def withdraw(self): self.calls.append(('withdraw',))
+        def deiconify(self): self.calls.append(('deiconify',))
+        def after(self,delay,callback):
+            self.calls.append(('after',delay))
+            callback()
         def lift(self): pass
         def focus_force(self): pass
     for w,h,x,windowed,expected in [(800,450,0,False,True),(800,480,0,False,False),
@@ -25,12 +30,16 @@ def test_fullscreen():
         a.args=types.SimpleNamespace(windowed=windowed,kiosk=False)
         a.q_ref=(0.5,0.5,0.5,0.5)
         a._verify_fullscreen()
-        assert (('geometry','800x480+0+0') in a.root.calls)==expected
+        # The final field fix remaps a managed window and asks the WM for real
+        # fullscreen once; it deliberately does not use borderless maximisation.
+        assert (('after',250) in a.root.calls)==expected
+        assert (('attr',('-fullscreen',True)) in a.root.calls)==expected
+        assert ('borderless',True) not in a.root.calls
         assert a.q_ref==(0.5,0.5,0.5,0.5)
 
 
 def test_zero_and_reboot():
-    """Moving/stale samples cannot change ZERO; a reboot changes its epoch."""
+    """Manual ZERO accepts a fresh sample; stale/rebooted samples are rejected."""
     link=app.UsbCompositeProbeLink()
     def publish(t,flags):
         link._publish(dict(timestamp_us=t,sequence=t,flags=flags,quaternion=(1,0,0,0)))
@@ -39,7 +48,9 @@ def test_zero_and_reboot():
     a.link,a.q_ref=link,(0,1,0,0)
     a.toast=lambda *args,**kwargs: None
     publish(100,flags)
-    assert not a.capture_zero() and a.q_ref==(0,1,0,0)
+    # Final field behavior: the operator's ZERO press is the stillness
+    # confirmation.  Firmware stationary is not a hard gate.
+    assert a.capture_zero() and a.q_ref==(1,0,0,0)
     publish(200,flags|app.USB_IMU_FLAG_STATIONARY)
     assert a.capture_zero() and a.q_ref==(1,0,0,0)
     saved=a.zero_gen

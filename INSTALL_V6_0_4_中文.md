@@ -1,7 +1,8 @@
 # v6.0.4 升级步骤
 
 **先看 WORK_STATUS.md / TEST_REPORT.md：若为 checkpoint 或构建未通过，不要刷机。**
-以下仅适用于包含真实 `release/atoms3r_cam_uvc_imu_v6_0_4.bin` 且标明构建通过的发布包。
+以下适用于包含真实 `release/atoms3r_cam_uvc_imu_v6_0_4.bin` 的现场恢复发布包。
+本包已经修正树莓派副本中“正确固件位于根目录、烧录脚本却从 release 查找”的错位。
 
 ## 需要改动什么
 
@@ -19,7 +20,13 @@
 ## 1. Windows 烧录（只在 Windows CMD 执行）
 
 退出相机、串口监视器和旧程序。摄像头接Windows；按住复位键约2秒，内部绿灯亮后松开，进入下载模式。
-在设备管理器看当前COM号。若解压目录如下，逐行执行：
+在设备管理器看当前COM号。最简单的方法是双击：
+
+```text
+FLASH_FIRMWARE_WINDOWS_DOUBLE_CLICK.bat
+```
+
+按提示输入 `COM6` 一类的实际端口。也可以在 CMD 中逐行执行：
 
 ```bat
 cd /d "C:\Users\weic\Downloads\atoms3r_cam_endoscope_v6_0_4\atoms3r-cam-endoscope"
