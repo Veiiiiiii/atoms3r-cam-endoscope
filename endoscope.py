@@ -3221,7 +3221,7 @@ def _uv_fsync_dir(folder):
         raise
 
 
-def _uv_write_json(path, obj, fsync=True):
+def _uv_write_json(path, obj, fsync=True, allow_nan=False):
     """Write JSON so that a power cut leaves either the old file or the new
     one, never half of each: write a temp file in the same directory, push
     it to the disk, then rename it over the target in one step (and, for
@@ -3239,7 +3239,12 @@ def _uv_write_json(path, obj, fsync=True):
     (ENOSPC/EDQUOT), which must not truncate the existing good file --
     falls back to writing path in place rather than losing the save. Any
     other failure to create the temp file propagates so the caller sees it
-    and the original file is left untouched (R3)."""
+    and the original file is left untouched (R3).
+    allow_nan=False (the default, for presets/export) rejects a NaN/Infinity
+    the way plain json.dump always refused to accept such values in those
+    files; save_cfg passes allow_nan=True so a stray non-finite number
+    already sitting in endoscope.json (from a hand edit or an older build)
+    cannot turn every future save into a silent no-op."""
     folder = os.path.dirname(os.path.abspath(path))
     os.makedirs(folder, exist_ok=True)
     tmp = "{}.{}.tmp".format(path, os.getpid())
@@ -3249,14 +3254,14 @@ def _uv_write_json(path, obj, fsync=True):
         if not isinstance(e, PermissionError) and e.errno not in (errno.EACCES, errno.EPERM):
             raise
         with open(path, "w", encoding="utf-8") as f:
-            json.dump(obj, f, indent=1, allow_nan=False)
+            json.dump(obj, f, indent=1, allow_nan=allow_nan)
             f.flush()
             if fsync:
                 os.fsync(f.fileno())
         return
     try:
         with tmp_file as f:
-            json.dump(obj, f, indent=1, allow_nan=False)
+            json.dump(obj, f, indent=1, allow_nan=allow_nan)
             f.flush()
             if fsync:
                 os.fsync(f.fileno())
@@ -3553,6 +3558,12 @@ class App:
                     self.cfg.get("uv_tuning_panel", UV_TUNING_PANEL_DEFAULT))
             except (TypeError, ValueError, OverflowError):
                 self.uv_tuning_panel = UV_TUNING_PANEL_DEFAULT
+            # A bad value here (e.g. a non-finite number from a hand edit)
+            # must not linger in self.cfg, or save_cfg's dict(self.cfg) would
+            # carry it into every future save; only touch the key when it
+            # was actually present, per R6 above.
+            if "uv_tuning_panel" in self.cfg:
+                self.cfg["uv_tuning_panel"] = self.uv_tuning_panel
             # Tuning presets (D11). The active preset survives a restart;
             # unsaved drawer edits live only in self.uv_work and are dropped
             # on a preset switch or a restart. A missing or damaged file
@@ -3596,6 +3607,7 @@ class App:
         self.uv_bar_box = None          # the bar's whole backdrop rectangle
         self.uv_bar_bg = []             # its plain-background rectangles
         self._uv_shape = None           # frame size the tracked boxes belong to
+        self._uv_orient = None          # (rot180, flip_h, flip_v) they belong to
         self._uv_gen = None             # link generation they belong to
         self._uv_stale = False
         self._uv_slow_run = 0           # consecutive frames over UV_SLOW_MS
@@ -3835,7 +3847,11 @@ class App:
             # FLIP/UV tap, far more often than a deliberate preset SAVE, and
             # os.replace() alone already keeps the old file or the new one
             # whole (ext4's auto_da_alloc flushes a rename-over-existing).
-            _uv_write_json(CONFIG, out, fsync=False)
+            # allow_nan=True: endoscope.json is hand-editable and a stray
+            # non-finite number anywhere in it (this file's own or an
+            # unrelated key) must not make every future save raise and
+            # silently stop persisting MIRROR/FLIP/axis changes.
+            _uv_write_json(CONFIG, out, fsync=False, allow_nan=True)
             self.cfg = out
         except Exception:
             pass
@@ -4594,9 +4610,12 @@ class App:
         """Filter / detect / boost one oriented capture-size frame.
         Returns (frame to show, info), or (frame, None) on any failure."""
         try:
-            if frame.shape[:2] != self._uv_shape:
+            orient = (self.rot180, self.video_flip_h, self.video_flip_v)
+            if frame.shape[:2] != self._uv_shape or orient != self._uv_orient:
                 self._uv_shape = frame.shape[:2]
-                self.uv_proc.reset()    # old boxes are in the old size's pixels
+                self._uv_orient = orient
+                self.uv_proc.reset()    # old boxes are in the old size's
+                                         # pixels, or the old orientation's
             out, info = self.uv_proc.process(frame, draw=False)
             self._uv_ms = info.get("ms")
             self._uv_perf_guard(info.get("ms", 0.0))
@@ -4670,6 +4689,7 @@ class App:
         if self.uv_mode:
             self._uv_apply_opts()       # last toggles, fresh tracker
             self._uv_shape = None
+            self._uv_orient = None
         else:
             self.uv_drawer_open = False
             self._uv_list_open = False
