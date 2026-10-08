@@ -547,6 +547,42 @@ def test_tracker_resets(mod):
           "(once), toggle; never in steady state")
 
 
+def test_tracker_resets_on_orientation_change(mod):
+    """F1: MIRROR L/R, FLIP U/D and PI: ROTATE 180 each invalidate the
+    tracked boxes too -- they describe the old orientation's pixels, same
+    as a frame-size change -- but steady state (no orientation change)
+    still takes no reset."""
+    app, link, spy = make_app(mod, scene())
+    try:
+        resets = []
+        real = app.uv_proc.reset
+        app.uv_proc.reset = lambda: (resets.append(1), real())
+        app.toggle_uv_mode()
+        assert len(resets) == 1                     # entering UV
+        tick(app, link)
+        n = len(resets)
+        tick(app, link)
+        assert len(resets) == n                     # steady state: no resets
+        app.toggle_video_flip_h()
+        tick(app, link)
+        assert len(resets) == n + 1                 # MIRROR L/R
+        tick(app, link)
+        assert len(resets) == n + 1                 # steady again
+        app.toggle_video_flip_v()
+        tick(app, link)
+        assert len(resets) == n + 2                 # FLIP U/D
+        n2 = len(resets)
+        app.rot180 = not app.rot180
+        tick(app, link)
+        assert len(resets) == n2 + 1                # PI: ROTATE 180
+        tick(app, link)
+        assert len(resets) == n2 + 1                # steady again
+    finally:
+        close(app)
+    print("PASS: TRACKER ORIENTATION -- MIRROR L/R, FLIP U/D and ROTATE 180 each reset the "
+          "tracker once, never in steady state")
+
+
 def test_blob_pixels(mod):
     """(i) BOOST changes pixels inside the fluorescent region only; SMART BOX
     draws the box at display resolution."""
@@ -1114,6 +1150,36 @@ def test_save_cfg_atomic(mod):
           "file left behind, and a normal save still persists")
 
 
+def test_save_cfg_survives_non_finite_values(mod):
+    """F2: a hand-edited (or otherwise damaged) endoscope.json with a
+    non-finite number -- in uv_tuning_panel or in some unrelated key --
+    must not turn every later save_cfg into a silent no-op the way plain
+    json.dump(allow_nan=False) would: save_cfg always writes with
+    allow_nan=True, and a present uv_tuning_panel is stored back coerced
+    to a real bool so it stops being non-finite at all."""
+    cfg = {"config_rev": mod.CONFIG_REV, "uv_tuning_panel": 1e999,
+           "some_unrelated_key": float("nan")}
+    app, link, spy = make_app(mod, scene(), cfg=cfg)
+    try:
+        # The bad value falls back to the module default and is not left
+        # sitting in self.cfg to poison the next save.
+        assert app.uv_tuning_panel is mod.UV_TUNING_PANEL_DEFAULT
+        assert app.cfg["uv_tuning_panel"] is mod.UV_TUNING_PANEL_DEFAULT
+        app.toggle_video_flip_h()            # a MIRROR tap calls save_cfg()
+        text = Path(mod.CONFIG).read_text(encoding="utf-8")
+        saved = json.loads(text)
+        assert saved["video_flip_h"] is True
+        assert saved["uv_tuning_panel"] is mod.UV_TUNING_PANEL_DEFAULT
+        # And it keeps surviving a reload/resave, not just the first one.
+        app.toggle_video_flip_h()
+        saved2 = json.loads(Path(mod.CONFIG).read_text(encoding="utf-8"))
+        assert saved2["video_flip_h"] is False
+    finally:
+        close(app)
+    print("PASS: SAVE CFG NON-FINITE -- a non-finite uv_tuning_panel or an unrelated NaN key "
+          "no longer stops save_cfg from writing, and uv_tuning_panel is stored back as a bool")
+
+
 def test_tuning_panel_default_not_sticky(mod):
     """R6: uv_tuning_panel is read with .get(..., UV_TUNING_PANEL_DEFAULT),
     never setdefault -- a config that never mentions the key must stay that
@@ -1529,6 +1595,7 @@ def main():
     test_error_fallback(new)
     test_relayout_and_stages(new)
     test_tracker_resets(new)
+    test_tracker_resets_on_orientation_change(new)
     test_blob_pixels(new)
     test_perf_guard(new)
     test_drawer_hidden_by_default(new)
@@ -1538,6 +1605,7 @@ def main():
     test_presets(new)
     test_diag_hides_bar(new)
     test_save_cfg_atomic(new)
+    test_save_cfg_survives_non_finite_values(new)
     test_tuning_panel_default_not_sticky(new)
     test_export_async(new)
     test_item_bind_leak_bounded(new)
