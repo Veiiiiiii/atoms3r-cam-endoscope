@@ -102,7 +102,10 @@ def test_load_partial_and_bad_entries(mod):
     p.write_text(json.dumps(raw), encoding="utf-8")
     data = mod.uv_presets_load(str(p))
     ids = [e["id"] for e in data["presets"]]
-    assert ids == ["pB", "pA", "pC", "pG"], ids             # newest first, junk dropped
+    # R4: file order kept, not re-sorted by "created" -- good_old (pA) comes
+    # before good_new (pB) in the raw list even though pB's timestamp is
+    # later, and the load must not swap them.
+    assert ids == ["pA", "pC", "pB", "pG"], ids             # file order, junk dropped
     assert data["active"] == "pA"
     by = {e["id"]: e for e in data["presets"]}
     assert by["pA"]["params"]["exposure"] == 1.5
@@ -116,7 +119,33 @@ def test_load_partial_and_bad_entries(mod):
     p.write_text(json.dumps(raw), encoding="utf-8")
     assert mod.uv_presets_load(str(p))["active"] == "factory"
     print("PASS: PARTIAL -- bad entries dropped one by one, partial params filled from "
-          "factory, newest first, unknown active -> FACTORY")
+          "factory, file order kept, unknown active -> FACTORY")
+
+
+def test_load_keeps_order_with_backwards_clock(mod):
+    """R4: an offline Pi's clock can jump backwards between SAVEs, so a
+    preset saved later can carry an earlier "created" timestamp than one
+    saved before it. uv_presets_load must not use "created" to reorder --
+    SAVE already writes newest-first, so the file order IS the right order,
+    clock or no clock."""
+    d = fresh("clock")
+    p = d / "presets.json"
+    # Saved in this order (newest-first, as SAVE writes): "newer" first, then
+    # "older" -- but the clock jumped back, so "newer"'s own timestamp is
+    # EARLIER than "older"'s. A sort-by-created would swap them back.
+    raw = {"version": 1, "active": "newer", "presets": [
+        entry(mod, "newer", "09:00 07-10", "2026-10-07T09:00:00", exposure=1.9),
+        entry(mod, "older", "10:00 07-10", "2026-10-07T10:00:00", exposure=1.1)]}
+    p.write_text(json.dumps(raw), encoding="utf-8")
+    data = mod.uv_presets_load(str(p))
+    assert [e["id"] for e in data["presets"]] == ["newer", "older"]
+    assert data["presets"][0]["params"]["exposure"] == 1.9
+    # A round trip through uv_presets_save (which does not sort either)
+    # keeps that same order on disk and on the next load.
+    assert mod.uv_presets_save(str(p), data)
+    assert [e["id"] for e in mod.uv_presets_load(str(p))["presets"]] == ["newer", "older"]
+    print("PASS: BACKWARDS CLOCK -- file order survives a load/save round trip "
+          "even when 'created' timestamps are out of order")
 
 
 def test_load_nan_and_ranges(mod):
@@ -153,7 +182,16 @@ def test_save_roundtrip_and_atomic(mod):
         entry(mod, "pB", "11:00 02-10", "2026-10-02T11:00:00", warmth=0.3),
         entry(mod, "pA", "10:00 01-10", "2026-10-01T10:00:00"),
         entry(mod, "factory", "FACTORY", "", exposure=2.0)]}  # never stored
-    assert mod.uv_presets_save(str(p), data) is True
+    # uv_presets_save (unlike uv_export, R1) still fsyncs: _uv_write_json's
+    # fsync=True default is untouched for every caller except uv_export.
+    fsyncs = []
+    real_fsync = mod.os.fsync
+    mod.os.fsync = lambda fd: (fsyncs.append(1), real_fsync(fd))[-1]
+    try:
+        assert mod.uv_presets_save(str(p), data) is True
+    finally:
+        mod.os.fsync = real_fsync
+    assert fsyncs == [1], fsyncs
     stored = json.loads(p.read_text(encoding="utf-8"))
     assert stored["version"] == 1 and stored["active"] == "pB"
     assert [e["id"] for e in stored["presets"]] == ["pB", "pA"]
@@ -213,19 +251,25 @@ def test_naming(mod):
 
 # --------------------------------------------------------------- export dir
 def test_export_dir(mod):
+    """R2: three search tiers, in priority order -- /media/<user>/* (the
+    normal case), then /media/*/* (the app can run as a different effective
+    user than whoever's folder the stick actually mounted under -- root via
+    systemd, or a desktop test run as someone else), then a bare
+    /media/<label> some distros use instead. Unmounted, read-only and plain
+    file candidates are skipped at every tier; nothing anywhere -> home."""
     d = fresh("media")
     home = d / "home" / "pi"
     home.mkdir(parents=True, exist_ok=True)
     media = d / "media"
-    user = media / "pi"
+    pi_dir, bob_dir = media / "pi", media / "bob"
     for sub in ("AAA_not_mounted", "BBB_readonly", "CCC_stick"):
-        (user / sub).mkdir(parents=True, exist_ok=True)
+        (pi_dir / sub).mkdir(parents=True, exist_ok=True)
+    (bob_dir / "DDD_stick").mkdir(parents=True, exist_ok=True)
     (media / "ZZZ_bare").mkdir(parents=True, exist_ok=True)
-    (user / "a_file").write_text("x")
-    mounts = {str(user / "BBB_readonly"), str(user / "CCC_stick"), str(media / "ZZZ_bare"),
-              str(user / "a_file")}
-    readonly = {str(user / "BBB_readonly")}
+    (pi_dir / "a_file").write_text("x")
+    readonly = {str(pi_dir / "BBB_readonly")}
     real_ismount, real_access = mod.os.path.ismount, mod.os.access
+    mounts = set()
 
     def fake_ismount(p):
         return str(p) in mounts
@@ -236,28 +280,50 @@ def test_export_dir(mod):
         return real_access(p, mode)
     mod.os.path.ismount, mod.os.access = fake_ismount, fake_access
     try:
+        # Tier 1 (/media/<user>/*) wins even with valid tier-2/3 candidates
+        # mounted at the same time.
+        mounts |= {str(pi_dir / "BBB_readonly"), str(pi_dir / "CCC_stick"),
+                  str(bob_dir / "DDD_stick"), str(media / "ZZZ_bare")}
         got = mod.uv_find_export_dir(home=str(home), media_root=str(media), user="pi")
-        assert got == (str(user / "CCC_stick" / "Endoscope_UV_presets"), True), got
-        mounts.discard(str(user / "CCC_stick"))
+        assert got == (str(pi_dir / "CCC_stick" / "Endoscope_UV_presets"), True), got
+        # Tier 2 (/media/*/*): nothing under /media/pi now, but the stick
+        # under another account's folder (bob) is still found, ahead of the
+        # bare tier-3 candidate that is ALSO mounted right now.
+        mounts.clear()
+        mounts |= {str(bob_dir / "DDD_stick"), str(media / "ZZZ_bare")}
+        got = mod.uv_find_export_dir(home=str(home), media_root=str(media), user="pi")
+        assert got == (str(bob_dir / "DDD_stick" / "Endoscope_UV_presets"), True), got
+        # Same again when the requesting user's own /media folder does not
+        # exist at all (e.g. the app running as root, or as a user who has
+        # never had a stick mounted).
+        got = mod.uv_find_export_dir(home=str(home), media_root=str(media), user="nouser")
+        assert got == (str(bob_dir / "DDD_stick" / "Endoscope_UV_presets"), True), got
+        # Tier 3 (bare /media/<label>): only the flat mount is left.
+        mounts.clear()
+        mounts.add(str(media / "ZZZ_bare"))
         got = mod.uv_find_export_dir(home=str(home), media_root=str(media), user="pi")
         assert got == (str(media / "ZZZ_bare" / "Endoscope_UV_presets"), True), got
-        mounts.discard(str(media / "ZZZ_bare"))
+        # Unmounted, read-only and a plain file are skipped at every tier.
+        mounts.clear()
+        mounts |= {str(pi_dir / "BBB_readonly"), str(pi_dir / "a_file")}
         got = mod.uv_find_export_dir(home=str(home), media_root=str(media), user="pi")
         assert got == (str(home / "Endoscope_UV_presets"), False), got
-        # No /media at all, and an unknown user.
+        # Nothing mounted anywhere, and no /media at all.
+        mounts.clear()
+        got = mod.uv_find_export_dir(home=str(home), media_root=str(media), user="pi")
+        assert got == (str(home / "Endoscope_UV_presets"), False), got
         got = mod.uv_find_export_dir(home=str(home), media_root=str(d / "nope"), user="pi")
         assert got == (str(home / "Endoscope_UV_presets"), False)
-        mounts.add(str(user / "CCC_stick"))
-        got = mod.uv_find_export_dir(home=str(home), media_root=str(media), user="bob")
-        assert got == (str(home / "Endoscope_UV_presets"), False), got
-        # The user name defaults to $USER / the home folder's name.
+        # The user name defaults to $USER / the home folder's name, and (via
+        # tier 2) a stick is still found even if that default is not "pi".
+        mounts.add(str(pi_dir / "CCC_stick"))
         got = mod.uv_find_export_dir(home=str(home), media_root=str(media))
-        if os.environ.get("USER", os.environ.get("LOGNAME", "pi")) == "pi":
-            assert got[1] is True
+        assert got[1] is True, got
     finally:
         mod.os.path.ismount, mod.os.access = real_ismount, real_access
-    print("PASS: EXPORT DIR -- first writable mounted stick under /media/<user>, then /media; "
-          "unmounted, read-only and plain files skipped; else ~/Endoscope_UV_presets")
+    print("PASS: EXPORT DIR -- /media/<user>/* first, then /media/*/* (another "
+          "account's folder), then a bare /media/<label>; unmounted/read-only/"
+          "plain files skipped at every tier; else ~/Endoscope_UV_presets")
 
 
 # --------------------------------------------------------------- export files
@@ -275,16 +341,26 @@ def test_export_files(mod):
     had_sync = hasattr(mod.os, "sync")
     real_sync = getattr(mod.os, "sync", None)
     mod.os.sync = lambda: calls.append(1)
+    # R1: EXPORT must not fsync every one of the (preset count + 1) files --
+    # that is a real disk wait per file, which is what froze the touch UI.
+    # Only the single trailing os.sync() (checked above, USB only) still
+    # guarantees everything is flushed before the "safe to unplug" toast.
+    fsyncs = []
+    real_fsync = mod.os.fsync
+    mod.os.fsync = lambda fd: (fsyncs.append(1), real_fsync(fd))[-1]
     try:
         paths = mod.uv_export(str(d), presets, toggles, t, sync=True)
         assert calls == [1]
+        assert fsyncs == [], "uv_export must skip the per-file fsync (R1)"
         mod.uv_export(str(d / "nosync"), presets[:1], toggles, t)
         assert calls == [1]
+        assert fsyncs == []
     finally:
         if had_sync:
             mod.os.sync = real_sync
         else:
             del mod.os.sync
+        mod.os.fsync = real_fsync
     names = [Path(p).name for p in paths]
     assert names == ["uv_params_20261007-1432_FACTORY.json",
                      "uv_params_20261007-1432_14_32_07-10.json",
@@ -362,6 +438,7 @@ def main():
     mod = load_endoscope()
     test_load_missing_and_corrupt(mod)
     test_load_partial_and_bad_entries(mod)
+    test_load_keeps_order_with_backwards_clock(mod)
     test_load_nan_and_ranges(mod)
     test_save_roundtrip_and_atomic(mod)
     test_naming(mod)

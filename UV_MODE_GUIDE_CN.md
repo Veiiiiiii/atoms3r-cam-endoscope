@@ -40,7 +40,7 @@
 
 ## 正式版隐藏调参抽屉
 
-- 调参抽屉是测试版特性，正式发布前可以整体隐藏：把 `~/.config/endoscope.json` 里的 `"uv_tuning_panel"` 改成 `false`（默认是 `true`）。
+- 调参抽屉是测试版特性，正式发布前可以整体隐藏：把 `~/.config/endoscope.json` 里的 `"uv_tuning_panel"` 改成 `false`（代码里的默认值是 `true`；这个键不会自动写入配置文件，必须手动加进去改成 `false` 才会隐藏抽屉）。
 - 改为 `false` 后，UV 模式下右边缘不会出现任何箭头标签，操作员只能用底部按钮条的三个开关，看不到、也碰不到调参功能。
 - 三个开关本身（BOOST/SMART BOX/FILTER）不受这个开关影响，正式版和测试版操作员体验一致。
 

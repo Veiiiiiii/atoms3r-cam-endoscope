@@ -22,6 +22,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import types
 from pathlib import Path
@@ -195,6 +196,20 @@ def tick(app, link, frame=None):
     app.update()
 
 
+def wait_export(app, timeout=2.0):
+    """R1: EXPORT finishes on a daemon thread and reports back through
+    root.after(150) polling -- pump the real Tk loop until the busy flag
+    clears instead of asserting on it synchronously. A timeout means the
+    poll never ran, i.e. a real bug, not a flaky test."""
+    t0 = time.monotonic()
+    while app._uv_export_busy:
+        if time.monotonic() - t0 > timeout:
+            raise AssertionError("EXPORT never finished (R1 poll stuck?)")
+        time.sleep(0.01)
+        app.root.update()
+    app.root.update()
+
+
 # --------------------------------------------------------------- frames
 def scene(h=240, w=320, seed=7):
     """A textured, non-symmetric BGR test frame (no fluorescent colours)."""
@@ -325,26 +340,30 @@ def test_toggles_persist(mod):
     finally:
         close(app)
 
-    # Junk and old-revision configs fall back to sane defaults.
+    # Junk and old-revision configs fall back to sane defaults. want_panel_key
+    # is R6: "uv_tuning_panel" round-trips through save_cfg only when the
+    # loaded config already had it -- no setdefault ever adds it.
     rev = mod.CONFIG_REV
-    for cfg, want in (
+    for cfg, want, want_panel_key in (
             ({"config_rev": rev, "uv": {"boost": "maybe", "boxes": "off", "filter": None}},
-             {"boost": True, "boxes": False, "filter": False}),
+             {"boost": True, "boxes": False, "filter": False}, False),
             ({"config_rev": rev, "uv": "garbage", "uv_tuning_panel": "no"},
-             {"boost": True, "boxes": True, "filter": False}),
+             {"boost": True, "boxes": True, "filter": False}, True),
             ({"config_rev": rev - 1, "uv": {"boost": False, "boxes": False, "filter": True}},
-             {"boost": True, "boxes": True, "filter": False})):
+             {"boost": True, "boxes": True, "filter": False}, False)):
         app, link, spy = make_app(mod, scene(), cfg=cfg)
         try:
             assert app.uv_mode is False and app.uv_opts == want, (cfg, app.uv_opts)
             assert app.uv_tuning_panel == (cfg.get("uv_tuning_panel") != "no")
             app.save_cfg()
             saved = json.loads(Path(mod.CONFIG).read_text(encoding="utf-8"))
-            assert saved["uv"] == want and "uv_tuning_panel" in saved
+            assert saved["uv"] == want
+            assert ("uv_tuning_panel" in saved) == want_panel_key, saved
         finally:
             close(app)
     print("PASS: TOGGLES -- flip, persist to cfg['uv'], map to params (detect = boost or boxes), "
-          "check marks; restart boots normal with saved toggles; junk/migrated config -> defaults")
+          "check marks; restart boots normal with saved toggles; junk/migrated config -> defaults; "
+          "uv_tuning_panel never added by a setdefault (R6)")
 
 
 def test_bar_clicks_and_geometry(mod):
@@ -987,9 +1006,12 @@ def test_presets(mod):
         assert json.loads(path.read_text(encoding="utf-8")) == {
             "version": 1, "active": "factory", "presets": []}
         # EXPORT: FACTORY + bundle into the (redirected) export folder.
+        # R1: the write happens on a daemon thread now -- wait_export pumps
+        # the Tk loop until the root.after(150) poll reports it is done.
         export = Path(mod.uv_find_export_dir()[0])
         head_tap(app, "save")
         head_tap(app, "export")
+        wait_export(app)
         files = sorted(p.name for p in export.iterdir())
         assert len([f for f in files if f.startswith("uv_params_")]) >= 2, files
         assert any(f.endswith("_FACTORY.json") for f in files)
@@ -997,12 +1019,15 @@ def test_presets(mod):
         toast = [app.canvas.itemcget(i, "text") for i in app.toast_items
                  if app.canvas.type(i) == "text"]
         assert toast and toast[0].startswith("EXPORTED 3 FILES"), toast
-        # A failing export is a toast, never an exception into Tk.
+        # A failing export is a toast, never an exception into Tk: the
+        # OSError happens on the worker thread, and the poll (Tk thread)
+        # turns it into the toast.
         real_export = mod.uv_export
         mod.uv_export = lambda *a, **k: (_ for _ in ()).throw(OSError("disk full"))
         try:
             with contextlib.redirect_stderr(io.StringIO()):
                 head_tap(app, "export")
+                wait_export(app)
         finally:
             mod.uv_export = real_export
         toast = [app.canvas.itemcget(i, "text") for i in app.toast_items
@@ -1058,6 +1083,201 @@ def test_diag_hides_bar(mod):
     print("PASS: DIAG -- bar hidden and inert under the DIAG grid, restored after")
 
 
+# ------------------------------------------- review fixes R1/R3/R5/R7/R8 (item 7b)
+def test_save_cfg_atomic(mod):
+    """R3: save_cfg writes through _uv_write_json (temp file + os.replace),
+    so a failure mid-write (the rename itself) leaves the previous
+    endoscope.json untouched -- never half-written -- and save_cfg's own
+    try/except still swallows the failure instead of raising into Tk."""
+    app, link, spy = make_app(mod, scene())
+    try:
+        app.save_cfg()
+        before = Path(mod.CONFIG).read_bytes()
+        real_replace = mod.os.replace
+        mod.os.replace = lambda *a, **k: (_ for _ in ()).throw(OSError("power cut"))
+        try:
+            app.video_flip_h = True      # a real change that would be written
+            app.save_cfg()               # must not raise
+        finally:
+            mod.os.replace = real_replace
+        assert Path(mod.CONFIG).read_bytes() == before, "failed rename must keep the old file"
+        leftovers = [p for p in Path(mod.CONFIG).parent.iterdir()
+                    if p.name.startswith(Path(mod.CONFIG).name + ".")]
+        assert leftovers == [], leftovers
+        # A normal save (no fault injected) really does persist the change.
+        app.save_cfg()
+        assert json.loads(Path(mod.CONFIG).read_text(
+            encoding="utf-8"))["video_flip_h"] is True
+    finally:
+        close(app)
+    print("PASS: SAVE CFG ATOMIC -- a failed rename leaves endoscope.json intact, no temp "
+          "file left behind, and a normal save still persists")
+
+
+def test_tuning_panel_default_not_sticky(mod):
+    """R6: uv_tuning_panel is read with .get(..., UV_TUNING_PANEL_DEFAULT),
+    never setdefault -- a config that never mentions the key must stay that
+    way after boot and after a save, so a later release build can flip the
+    module constant and have it take effect on every such config instead of
+    a True frozen in by an earlier boot."""
+    app, link, spy = make_app(mod, scene())
+    try:
+        assert "uv_tuning_panel" not in app.cfg
+        assert app.uv_tuning_panel is mod.UV_TUNING_PANEL_DEFAULT is True
+        app.save_cfg()
+        saved = json.loads(Path(mod.CONFIG).read_text(encoding="utf-8"))
+        assert "uv_tuning_panel" not in saved, (
+            "save_cfg must not freeze the default into the config file")
+    finally:
+        close(app)
+    # An explicit key in the file (the engineer hiding the drawer by hand,
+    # or a release build's installer dropping one in) is still honoured.
+    app, link, spy = make_app(mod, scene(),
+                              cfg={"config_rev": mod.CONFIG_REV, "uv_tuning_panel": False})
+    try:
+        assert app.uv_tuning_panel is False
+    finally:
+        close(app)
+    print("PASS: TUNING PANEL DEFAULT -- not written by setdefault (a release build's module "
+          "constant alone controls it for untouched configs), an explicit key is honoured")
+
+
+def test_export_async(mod):
+    """R1: EXPORT's write happens off the Tk thread -- App.update() must
+    return immediately even while the write is artificially slow, a second
+    tap while busy is EXPORT BUSY and does not start a second write, and a
+    worker exception becomes a toast instead of an unhandled thread crash."""
+    app, link, spy = make_app(mod, scene())
+    try:
+        app.toggle_uv_mode()
+        tab_tap(app)
+        gate = threading.Event()
+        calls = []
+        real_export = mod.uv_export
+
+        def slow_export(*a, **k):
+            calls.append(1)
+            gate.wait(2.0)              # stands in for a stalled USB write
+            return real_export(*a, **k)
+        mod.uv_export = slow_export
+        try:
+            head_tap(app, "export")
+            assert app._uv_export_busy
+            toast = [app.canvas.itemcget(i, "text") for i in app.toast_items
+                     if app.canvas.type(i) == "text"]
+            assert toast == ["EXPORTING…"], toast
+            # The per-frame loop must not be the one blocked on the gate --
+            # the worker thread is.
+            t0 = time.monotonic()
+            tick(app, link)
+            assert time.monotonic() - t0 < 0.5, "update() blocked on the export"
+            # A second tap while busy is ignored: a toast, no second write.
+            head_tap(app, "export")
+            toast = [app.canvas.itemcget(i, "text") for i in app.toast_items
+                     if app.canvas.type(i) == "text"]
+            assert toast == ["EXPORT BUSY"], toast
+            assert calls == [1]
+            gate.set()
+            wait_export(app)
+            toast = [app.canvas.itemcget(i, "text") for i in app.toast_items
+                     if app.canvas.type(i) == "text"]
+            assert toast and toast[0].startswith("EXPORTED"), toast
+            assert not app._uv_export_busy
+        finally:
+            mod.uv_export = real_export
+            gate.set()
+    finally:
+        close(app)
+    print("PASS: EXPORT ASYNC -- update() never blocks on a slow write, a tap while busy is "
+          "EXPORT BUSY (no second write started), the result toast lands once the worker is done")
+
+
+def test_item_bind_leak_bounded(mod):
+    """R5: button() and _uv_build_tab's tag_bind commands must not leak.
+    Every UV toggle and every drawer open/close goes through set_stage,
+    which rebuilds every button; 300 cycles must leave the Tcl interpreter's
+    command table bounded, not growing with the iteration count."""
+    app, link, spy = make_app(mod, scene())
+    try:
+        before = len(app.canvas._tclCommands)
+        for _ in range(300):
+            app.toggle_uv_mode()
+            tab_tap(app)             # opens the drawer (arrow tab)
+            tab_tap(app)             # closes it again
+            app.toggle_uv_mode()
+        after = len(app.canvas._tclCommands)
+        assert after - before < 200, (
+            "canvas._tclCommands grew by {} over 300 cycles -- tag_bind leak"
+            .format(after - before))
+    finally:
+        close(app)
+    print("PASS: ITEM BIND LEAK -- 300 UV toggle / drawer open-close cycles keep "
+          "canvas._tclCommands bounded")
+
+
+def test_uv_mode_needs_usb_camera(mod):
+    """R7: toggle_uv_mode refuses to ENTER UV mode on the legacy serial
+    link (no clean_video): a WARN toast, no state change, and the dev key
+    goes through the same refusal. EXIT must still work regardless."""
+    if os.path.exists(mod.CONFIG):
+        os.remove(mod.CONFIG)
+    presets = getattr(mod, "UV_PRESETS_FILE", None)
+    if presets and os.path.exists(presets):
+        os.remove(presets)
+    link = StaticLink(scene())
+    link.is_uvc = False                 # the legacy serial probe, not UVC
+    spy = ImageSpy()
+    mod.Image = spy
+    app = mod.App(link, make_args())
+    app.root.update()
+    try:
+        assert app.clean_video is False
+        app.toggle_uv_mode()
+        assert app.uv_mode is False
+        toast = [app.canvas.itemcget(i, "text") for i in app.toast_items
+                 if app.canvas.type(i) == "text"]
+        assert toast == ["UV MODE NEEDS THE USB CAMERA"], toast
+        # The dev key 'u' (RUN only) is refused the same way.
+        app.on_key(types.SimpleNamespace(keysym="u"))
+        assert app.uv_mode is False
+        # EXIT must always work, even if UV mode were somehow already on
+        # (e.g. a link swap after entry).
+        app.uv_mode = True
+        app.toggle_uv_mode()
+        assert app.uv_mode is False
+    finally:
+        close(app)
+    print("PASS: UV NEEDS USB CAMERA -- entering UV mode on the legacy serial link is refused "
+          "(toast, no state change, dev key too); EXIT always works")
+
+
+def test_small_portrait_geometry(mod):
+    """R8: tiny/portrait screens must never raise, and must keep the bottom
+    option bar and every open drawer slider track on-screen and usable."""
+    app, link, spy = make_app(mod, scene())
+    try:
+        for w, h in ((640, 480), (480, 800)):
+            resize_to(app, w, h)
+            app.toggle_uv_mode()
+            tick(app, link)
+            tab_tap(app)                 # open the drawer
+            tick(app, link)
+            pad = max(10, app.H // 46)
+            box = app.uv_bar_box
+            assert box is not None
+            assert box[0] >= pad and box[2] <= app.W - pad, (w, h, box)
+            for field, row in app._uv_rows.items():
+                tx = row.get("tx")
+                if tx is not None:
+                    assert tx[1] >= tx[0] + 20, (w, h, field, tx)
+            app.toggle_uv_mode()          # back off before the next geometry
+            tick(app, link)
+    finally:
+        close(app)
+    print("PASS: SMALL/PORTRAIT GEOMETRY -- 640x480 (drawer open) and 480x800 run with no "
+          "exceptions, the bottom bar stays inside [pad, W-pad], every slider track >= 20 px")
+
+
 def main():
     import tkinter as tk
     try:
@@ -1083,6 +1303,12 @@ def main():
     test_drawer_scroll(new)
     test_presets(new)
     test_diag_hides_bar(new)
+    test_save_cfg_atomic(new)
+    test_tuning_panel_default_not_sticky(new)
+    test_export_async(new)
+    test_item_bind_leak_bounded(new)
+    test_uv_mode_needs_usb_camera(new)
+    test_small_portrait_geometry(new)
     print("DONE: test_uv_ui.py")
 
 
