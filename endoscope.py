@@ -126,7 +126,7 @@ from PIL import Image, ImageTk
 
 CONFIG = os.path.join(os.path.expanduser("~"), ".config", "endoscope.json")
 SYNC = b"\xa5\x5a"
-APP_VER = "6.1.0"
+APP_VER = "6.2.0"
 CONFIG_REV = 6
 
 # One running instance owns /dev/video* and /dev/ttyACM*. A second launch that
@@ -3493,7 +3493,7 @@ UV_EXPORT_DIRNAME = "Endoscope_UV_presets"
 UV_MEDIA_ROOT = "/media"        # where Raspberry Pi OS automounts USB sticks
 UV_FACTORY_ID = "factory"
 UV_FACTORY_NAME = "FACTORY"
-UV_EXPORTED_BY = "Endoscope 6.2.0"
+UV_EXPORTED_BY = "Endoscope " + APP_VER
 
 
 def _uv_localtime(now=None):

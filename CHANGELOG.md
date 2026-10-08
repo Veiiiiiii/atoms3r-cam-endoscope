@@ -1,5 +1,43 @@
 # Changelog
 
+## 6.2.0 — UV fluorescence mode (test version)
+
+- New `UV MODE` button (left column, under FLIP U/D) switches the live view into
+  UV fluorescence analysis: detected regions boxed/labelled, optional boost
+  (saturation/brightness/edge-feather) and a warmth-corrected blue-cut filter.
+  A semi-transparent bottom bar (`BOOST` `SMART BOX` `FILTER` `EXIT UV`) lets the
+  operator flip each stage independently without hiding the picture.
+- Engineer tuning drawer (small arrow tab on the right edge, UV mode only):
+  touch-scrollable rows for every FILTER/DETECTION/BOOST/BOX parameter, a preset
+  switcher (FACTORY + saved presets, newest first), `SAVE` (auto-named
+  `HH:MM DD-MM`), `DELETE` (two-tap confirm), and `EXPORT` to a USB stick
+  (`<stick>/Endoscope_UV_presets/`) or `~/Endoscope_UV_presets/` otherwise.
+  Hidden entirely in a production build via `"uv_tuning_panel": false` in
+  `endoscope.json`.
+- Detection/boost/filter core (`UVParams`/`UVProcessor`/`BoxTracker`) is ported
+  from UVScope 1.1's `core.py` with bit-exact parity at scale 1 (see
+  `test_uv_core.py`); pixel-unit parameters (merge/open/feather px, box
+  thickness) scale by `analysis/display short side / 360` so the UVScope-tuned
+  look holds at any camera/display resolution. Colour thresholds and ratios are
+  unchanged.
+- Toggle states and the active preset persist across restarts
+  (`~/.config/endoscope.json`, `~/.config/endoscope_uv_presets.json`); the app
+  always boots in normal (non-UV) mode regardless of what was on before.
+- Invariant: with UV mode OFF, endoscope.py's RUN-stage frame path is
+  byte-identical to field-approved v6.1.0 (commit `0372214`) — same pixels,
+  same widgets/positions except the added `UV MODE` button. Verified by
+  `test_uv_ui.py`'s UV-OFF identity check against that commit.
+- No new dependencies: numpy + cv2 (already required by install_pi.sh) and the
+  stdlib are all this uses; the single-file endoscope.py deployment is unchanged.
+- Files added: `test_uv_core.py`, `test_uv_ui.py`, `test_uv_presets.py`,
+  `tools/uv_preview.py`, `tools/uv_bench.py`, `UV_MODE_GUIDE_CN.md`.
+- Still needs on-device confirmation before this is a production release: real
+  Raspberry Pi 5 frame timing (host numbers are a Windows dev-box estimate),
+  real touch behaviour for the bottom bar and tuning drawer, a real USB export
+  round-trip onto an actual stick, and detection-quality tuning under a real UV
+  lamp with this camera (current thresholds were tuned against a YouTube UV
+  reference video, not a live UV source).
+
 ## 6.1.0 — screen-mounted gyro: camera-relative-to-screen azimuth
 
 - New optional 2nd 6-axis IMU on the screen body (Seeed XIAO nRF52840 Sense,

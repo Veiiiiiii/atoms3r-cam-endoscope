@@ -97,3 +97,42 @@ python3 test_v604.py
 5. 仅在重建镜像、USB 字符串及实际哈希核对一致后，称为可复现源码版本。
 
 `source-recovery/` 保存上一构建环境的依赖锁和恢复记录，但其中没有完整 firmware 目录。任何后续 AI 或工程师都不得把官方 User Demo、旧 Arduino `.ino` 或旧 v6 镜像改名冒充本固件源码。
+
+## 9. v6.2.0 UV 模式
+
+UV 荧光分析模式全部在单文件 `endoscope.py` 内，不新增依赖（numpy/cv2 已在 install_pi.sh 里）。
+
+### 架构
+
+- **核心算法**（`endoscope.py` 约第 2800–3700 行）：`UVParams`（dataclass，默认值 = `UV_FACTORY` = 出厂 `uv_params.json`）、`UV_REF_SHORT_SIDE = 360`、`UV_DYE_PRESETS`（染料预设，来自 UVScope1.1 的 `PRESETS`）、`UVBoxTracker`（跨帧框体追踪/平滑）、`UVProcessor`（`_build_lut` / `apply_filter` / `_detect` / `_boost` / `_annotate` / `process`）。这些是从 `UVScope1.1\uvscope\core.py` 原样移植，在 scale=1 时逐像素一致（`test_uv_core.py` 的 PARITY 用例保证）。
+- **像素参数缩放**（计划 §3.2/D8）：`merge_px`/`open_px` 按分析帧的 `min(h,w)/360` 缩放，`feather_px` 和框线宽按显示分辨率的 `min(H,W)/360` 缩放，取整规则沿用 UVScope（`|1`、`>=3`）。颜色阈值和比例不缩放。
+- **App 侧固定 API 名**（计划 §3.9，供以后改动时对照）：`self.uv_mode`（bool）、`self.uv_opts`（`{"boost","boxes","filter"}` 三个布尔）、`self.uv_proc`（`UVProcessor` 实例）、`self.uv_drawer_open`（bool）；方法 `toggle_uv_mode()`、`uv_toggle(name)`、`toggle_uv_drawer()`（均在 endoscope.py 约第 4930–5060 行一带）。`UVProcessor.process(frame, draw=False)` 在采集分辨率跑一次，App 自己在显示分辨率把 `info["regions"]`/`info["contours"]` 画成框/标签，这样线条在任何屏幕分辨率下都清晰。
+- **UI**：`UV MODE` 按钮（左列，FLIP U/D 下方）；底部半透明条（`BOOST`/`SMART BOX`/`FILTER`/`EXIT UV`，背景色按 α 混合进画面像素，靠几何命中而不是 Tk 透明度）；右边缘小箭头拉出的调参抽屉（Canvas 覆盖层，触摸拖动滚动，`-`/`+`/拖动条改值）。
+- **预设与导出**：`uv_presets.py` 相关逻辑都在 endoscope.py 内——`UV_PRESETS_FILE`（`~/.config/endoscope_uv_presets.json`，FACTORY 不落盘）、`UV_EXPORTED_BY = "Endoscope " + APP_VER`（随版本号自动变化，不要再写死字符串）、导出辅助函数在约第 3490–3700 行（`_uv_write_json`、导出目录选择——U 盘优先、单预设文件 + 全量 bundle、`os.sync()`）。
+
+### 不变量
+
+- UV 模式关闭时，RUN 阶段画面像素和控件位置必须与 6.1.0（commit `0372214`）逐像素一致，唯一允许的差异是新增的 `UV MODE` 按钮本身；`test_uv_ui.py` 的 UV-OFF IDENTITY 用例直接拿 git 里的 6.1.0 `endoscope.py` 对比校验。
+- UV 处理或绘制中的任何异常只能回退显示原始帧、把 traceback 打到 stderr（落在 `~/.cache/endoscope-last-run.log`）、最多每 10 秒弹一次 `UV PROCESSING ERROR` 提示，绝不能让 Tk 主循环崩溃。
+- 除 SAVE/EXPORT 的小 JSON 写入外，UV 相关代码不得在 Tk 线程上做阻塞 I/O。
+- 新版本号只应该通过 `APP_VER`（endoscope.py 第 129 行附近）和 `VERSION` 文件改动；`UV_EXPORTED_BY` 已经是 `"Endoscope " + APP_VER` 派生值，升级版本号时它会自动跟着变，不需要也不应该单独修改。
+
+### 测试命令
+
+```bash
+py -3 test_uv_core.py
+PYTHONPATH=../winshim py -3 test_uv_ui.py
+PYTHONPATH=../winshim py -3 test_uv_presets.py
+PYTHONPATH=../winshim py -3 test_endoscope_core.py
+PYTHONPATH=../winshim py -3 test_v604.py
+PYTHONPATH=../winshim py -3 test_screen_gyro.py
+```
+
+`test_uv_ui.py`/`test_uv_presets.py`/`test_endoscope_core.py`/`test_v604.py`/`test_screen_gyro.py` 在 Windows 上需要 `PYTHONPATH=../winshim`，因为它们间接用到 Unix 专属的 `fcntl`（锁文件/原子写），`winshim` 提供一个仅供本机测试用的占位实现；树莓派本身是 Linux，不需要这个垫片。Windows 下跑应用本体做视觉确认用 `py -3 tools/uv_preview.py --shots DIR --seconds 14 [--geometry 800x480] [--video PATH]`；`tools/uv_bench.py` 测 UV 处理每帧耗时（320x240、640x480）。
+
+### 尚待现场验证
+
+- 真实 Raspberry Pi 5 上的处理耗时（当前 `test_uv_core.py`/`tools/uv_bench.py` 的数字是 Windows 开发机估算，不是 Pi 实测）；
+- 真实触屏下底部条和调参抽屉的点击/拖动手感；
+- 真实 U 盘插入后的 EXPORT 路径和文件；
+- 真实 UV 灯 + 这颗摄像头下的检测阈值（现在是对着 YouTube UV 视频调的，不是真实荧光光源）。
