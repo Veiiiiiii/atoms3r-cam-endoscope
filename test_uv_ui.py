@@ -1278,6 +1278,240 @@ def test_small_portrait_geometry(mod):
           "exceptions, the bottom bar stays inside [pad, W-pad], every slider track >= 20 px")
 
 
+# ------------------------------------------- second-round fixes (item 7d)
+def test_uv_init_guard(mod):
+    """S1: a UV-init failure that nothing lower in the stack catches
+    (simulated here by making uv_presets_load itself explode, then by
+    making the UVProcessor constructor explode) must never crash
+    App.__init__ -- the app still boots, UV off with FACTORY defaults
+    exactly like a first run, the traceback lands on stderr, and UV still
+    works normally afterwards."""
+    if os.path.exists(mod.CONFIG):
+        os.remove(mod.CONFIG)
+    presets_path = getattr(mod, "UV_PRESETS_FILE", None)
+    if presets_path and os.path.exists(presets_path):
+        os.remove(presets_path)
+    real_load = mod.uv_presets_load
+    mod.uv_presets_load = lambda path: (_ for _ in ()).throw(
+        RuntimeError("simulated UV-init failure"))
+    spy = ImageSpy()
+    mod.Image = spy
+    link = StaticLink(scene())
+    err = io.StringIO()
+    try:
+        with contextlib.redirect_stderr(err):
+            app = mod.App(link, make_args())            # must not raise
+        app.root.update()
+    finally:
+        mod.uv_presets_load = real_load
+    try:
+        assert app.uv_mode is False
+        assert app.uv_opts == dict(mod.UV_OPT_DEFAULTS), app.uv_opts
+        assert app.uv_tuning_panel is mod.UV_TUNING_PANEL_DEFAULT
+        assert app.uv_active_id == mod.UV_FACTORY_ID
+        assert app.uv_presets == {"version": 1, "active": mod.UV_FACTORY_ID, "presets": []}
+        assert isinstance(app.uv_proc, mod.UVProcessor)
+        assert "simulated UV-init failure" in err.getvalue()
+        # UV still works normally after falling back.
+        app.toggle_uv_mode()
+        tick(app, link)
+        assert app.uv_mode is True
+    finally:
+        close(app)
+    # A second, independent failure point: constructing the processor
+    # itself (not the presets loader) also falls back instead of raising.
+    if os.path.exists(mod.CONFIG):
+        os.remove(mod.CONFIG)
+    if presets_path and os.path.exists(presets_path):
+        os.remove(presets_path)
+    real_proc = mod.UVProcessor
+    calls = []
+
+    def flaky_proc(params):
+        calls.append(1)
+        if len(calls) == 1:
+            raise RuntimeError("simulated processor-init failure")
+        return real_proc(params)
+    mod.UVProcessor = flaky_proc
+    link2 = StaticLink(scene())
+    err2 = io.StringIO()
+    try:
+        with contextlib.redirect_stderr(err2):
+            app2 = mod.App(link2, make_args())           # must not raise
+        app2.root.update()
+    finally:
+        mod.UVProcessor = real_proc
+    try:
+        assert isinstance(app2.uv_proc, real_proc)
+        assert "simulated processor-init failure" in err2.getvalue()
+    finally:
+        close(app2)
+    print("PASS: UV INIT GUARD -- a UV-init exception (presets loader or processor "
+          "construction) never crashes App.__init__, boots to FACTORY/UV-off exactly like a "
+          "first run, logs the traceback, and UV still works normally afterwards")
+
+
+def test_bar_two_rows_clear_of_zero(mod):
+    """S3: a screen too narrow for one row beside ZERO, even off-centre and
+    at the smallest size/padding tried, drops to two rows of two instead of
+    the old clamp (which bounded the bar to W, not to ZERO's own left
+    edge) silently letting it overlap ZERO. 480x800 is such a screen --
+    test_bar_clicks_and_geometry already pins the single-row case at
+    1024x600/800x480, unaffected by any of this."""
+    app, link, spy = make_app(mod, scene())
+    try:
+        resize_to(app, 480, 800)
+        app.toggle_uv_mode()
+        tick(app, link)
+        zero = app.canvas.bbox(text_item(app, "ZERO"))
+        zero_rect = next(r for r in app.canvas.find_overlapping(*zero)
+                         if app.canvas.type(r) == "rectangle")
+        zx0, zy0, zx1, zy1 = app.canvas.coords(zero_rect)
+        bx0, by0, bx1, by1 = app.uv_bar_box
+        # The fallback actually engaged: a single row of four could not
+        # have been built this short at 480 px wide.
+        row_spans = sorted(set((y0, y1) for _, _, y0, _, y1, _ in app.uv_bar))
+        assert len(row_spans) == 2, ("expected two rows of two", app.uv_bar)
+        assert bx1 <= zx0 or zx1 <= bx0 or by1 <= zy0 or zy1 <= by0, (
+            "bar overlaps ZERO", app.uv_bar_box, app.canvas.coords(zero_rect))
+        assert bx0 >= 0 and by0 >= 0
+        for _, x0, y0, x1, y1, t in app.uv_bar:
+            tb = app.canvas.bbox(t)
+            assert x0 <= tb[0] and tb[2] <= x1, ("label overflows its button", app.uv_bar)
+        # Every button still works, one tap each.
+        calls = []
+        real = app.uv_toggle
+        app.uv_toggle = lambda name: (calls.append(name), real(name))[-1]
+        for name in ("boost", "boxes", "filter"):
+            b = next(b for b in app.uv_bar if b[0] == name)
+            app.canvas.event_generate("<Button-1>", x=(b[1] + b[3]) // 2, y=(b[2] + b[4]) // 2)
+            app.root.update()
+        assert calls == ["boost", "boxes", "filter"], calls
+    finally:
+        close(app)
+    print("PASS: BAR TWO ROWS -- 480x800 cannot fit one row beside ZERO at any size, drops to "
+          "two rows of two instead, still clear of ZERO, labels fit, every button still works")
+
+
+def test_track_hit_matches_drawn(mod):
+    """S4: the drawn track's extent and its hit rect must come from the
+    same variables -- on a narrow drawer (480x800) the -/+ buttons now
+    shrink (R8's own fix forced the DRAWN rectangle to a 20 px floor
+    without ever touching the "between the buttons" hit-test it forced its
+    way past) so every point across the drawn track really does hit-test
+    as "track", never drifting into "plus"."""
+    app, link, spy = make_app(mod, scene())
+    try:
+        resize_to(app, 480, 800)
+        app.toggle_uv_mode()
+        tick(app, link)
+        tab_tap(app)
+        tick(app, link)
+        checked = 0
+        for field, row in app._uv_rows.items():
+            tx = row.get("tx")
+            if tx is None:
+                continue
+            tx0, tx1 = tx
+            assert tx1 - tx0 >= 20, (field, tx)          # R8's own floor, unaffected
+            x0, y0, x1, y1 = next(h[:4] for h in app._uv_hits
+                                  if h[4] == "track" and h[5] == field)
+            if y0 - app._uv_moved < 0 or y1 - app._uv_moved > app._uv_body_h:
+                app._uv_scroll_to(y0 - 10)
+            cy = int((y0 + y1) / 2 - app._uv_moved)
+            for frac in (0.0, 0.25, 0.5, 0.75, 1.0):
+                x = int(round(tx0 + (tx1 - tx0) * frac))
+                hit = app._uv_body_target(x, cy)
+                assert hit == ("track", field), (field, x, cy, hit)
+                checked += 1
+        assert checked > 0
+    finally:
+        close(app)
+    print("PASS: TRACK HIT MATCHES DRAWN (S4) -- every point across the drawn track hit-tests "
+          "as 'track' at 480x800, never drifting into the +/- buttons' own hit rects")
+
+
+def test_body_tap_needs_slop(mod):
+    """S5: a body tap (track jump / preset / toggle / cycle / +-) only
+    acts if release lands back over the same target within UV_DRAG_SLOP of
+    the press point -- a fast swipe with no intervening motion event (so
+    "mode" never left "tap") used to act anyway, wherever release landed."""
+    app, link, spy = make_app(mod, scene())
+    try:
+        app.toggle_uv_mode()
+        tab_tap(app)
+        body = app.uv_db
+        x, y = body_point(app, "toggle", "uv_reject")
+        slop = mod.UV_DRAG_SLOP
+        # Press, then "teleport" straight to a release far outside the
+        # target with NO motion event in between -- exactly what a fast
+        # swipe looks like to Tk when the finger skips several pixels.
+        press(body, x, y)
+        release(body, x + slop * 6, y)
+        app.root.update()
+        assert app.uv_work.uv_reject == mod.UV_FACTORY["uv_reject"], (
+            "a swipe-like release far from the press point must not toggle")
+        # The same press, released back within slop, still acts.
+        press(body, x, y)
+        release(body, x + slop - 1, y + slop - 1)
+        app.root.update()
+        assert app.uv_work.uv_reject != mod.UV_FACTORY["uv_reject"]
+    finally:
+        close(app)
+    print("PASS: BODY TAP NEEDS SLOP -- a press/release pair with no motion event only acts "
+          "when release is still within UV_DRAG_SLOP of the press point and over the same "
+          "target; a fast swipe past that is ignored")
+
+
+def test_quit_waits_for_export(mod):
+    """S9: EXIT mid-export toasts FINISHING EXPORT... and joins the worker
+    (up to 3 s) before destroying anything, instead of abandoning it to
+    race the 4 s exit watchdog with no feedback to the operator."""
+    app, link, spy = make_app(mod, scene())
+    real_exit = mod.os._exit
+    mod.os._exit = lambda code=0: None    # neutralise quit()'s 4 s watchdog
+    try:
+        app.toggle_uv_mode()
+        tab_tap(app)
+        gate = threading.Event()
+        started = threading.Event()
+        real_export = mod.uv_export
+
+        def slow_export(*a, **k):
+            started.set()
+            gate.wait(2.0)
+            return real_export(*a, **k)
+        mod.uv_export = slow_export
+        try:
+            head_tap(app, "export")
+            assert started.wait(2.0), "export worker never started"
+            assert app._uv_export_busy
+            thread = app._uv_export_thread
+            assert thread is not None and thread.is_alive()
+            real_destroy = app.root.destroy
+            app.root.destroy = lambda: None   # inspect app state after quit()
+            gate.set()                        # let the write finish quickly
+            t0 = time.monotonic()
+            app.quit()
+            dt = time.monotonic() - t0
+            app.root.destroy = real_destroy
+            assert dt < 2.5, ("quit() took too long", dt)
+            texts = [app.canvas.itemcget(i, "text") for i in app.toast_items
+                     if app.canvas.type(i) == "text"]
+            assert texts == ["FINISHING EXPORT…"], texts
+            thread.join(2.0)
+            assert not thread.is_alive()
+            assert app._exiting is True
+        finally:
+            mod.uv_export = real_export
+            gate.set()
+    finally:
+        mod.os._exit = real_exit
+        close(app)
+    print("PASS: QUIT WAITS FOR EXPORT -- EXIT mid-export toasts FINISHING EXPORT..., joins "
+          "the worker thread before destroying anything, and still returns promptly")
+
+
 def main():
     import tkinter as tk
     try:
@@ -1309,6 +1543,11 @@ def main():
     test_item_bind_leak_bounded(new)
     test_uv_mode_needs_usb_camera(new)
     test_small_portrait_geometry(new)
+    test_uv_init_guard(new)
+    test_bar_two_rows_clear_of_zero(new)
+    test_track_hit_matches_drawn(new)
+    test_body_tap_needs_slop(new)
+    test_quit_waits_for_export(new)
     print("DONE: test_uv_ui.py")
 
 
