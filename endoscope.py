@@ -3522,50 +3522,97 @@ def uv_presets_load(path):
     offline Pi's clock can jump backwards and silently reorder every
     existing preset on the next load). Their params are already cleaned by
     UVParams.from_dict (so a NaN or an out-of-range value in the file is
-    factory/clamped from here on)."""
-    data = {"version": 1, "active": UV_FACTORY_ID, "presets": []}
+    factory/clamped from here on).
+    S1: "active" is checked for its type before the `in seen` membership
+    test -- a hand-edited file with "active": [] or {} used to raise
+    TypeError there (an unhashable value can't be tested against a set),
+    which crashed App.__init__ even with UV mode off. The whole body is
+    also wrapped so any OTHER shape this function does not yet anticipate
+    still comes back as "FACTORY only" instead of taking the app down."""
     try:
-        with open(path, encoding="utf-8") as f:
-            raw = json.load(f)
+        data = {"version": 1, "active": UV_FACTORY_ID, "presets": []}
+        try:
+            with open(path, encoding="utf-8") as f:
+                raw = json.load(f)
+        except Exception:
+            return data
+        if not isinstance(raw, dict):
+            return data
+        entries = raw.get("presets")
+        seen = set()
+        for e in entries if isinstance(entries, list) else []:
+            if not isinstance(e, dict):
+                continue
+            pid, name, params = e.get("id"), e.get("name"), e.get("params")
+            if (not isinstance(pid, str) or not pid.strip() or pid == UV_FACTORY_ID
+                    or pid in seen or not isinstance(name, str) or not name.strip()
+                    or not isinstance(params, dict)):
+                continue
+            created = e.get("created")
+            seen.add(pid)
+            data["presets"].append({
+                "id": pid, "name": name.strip()[:40],
+                "created": created if isinstance(created, str) else "",
+                "params": _uv_params_json(UVParams.from_dict(params))})
+        active = raw.get("active")
+        if isinstance(active, str) and active in seen:
+            data["active"] = active
+        return data
     except Exception:
-        return data
-    if not isinstance(raw, dict):
-        return data
-    entries = raw.get("presets")
-    seen = set()
-    for e in entries if isinstance(entries, list) else []:
-        if not isinstance(e, dict):
-            continue
-        pid, name, params = e.get("id"), e.get("name"), e.get("params")
-        if (not isinstance(pid, str) or not pid.strip() or pid == UV_FACTORY_ID
-                or pid in seen or not isinstance(name, str) or not name.strip()
-                or not isinstance(params, dict)):
-            continue
-        created = e.get("created")
-        seen.add(pid)
-        data["presets"].append({
-            "id": pid, "name": name.strip()[:40],
-            "created": created if isinstance(created, str) else "",
-            "params": _uv_params_json(UVParams.from_dict(params))})
-    if raw.get("active") in seen:
-        data["active"] = raw["active"]
-    return data
+        return {"version": 1, "active": UV_FACTORY_ID, "presets": []}
+
+
+def _uv_fsync_dir(folder):
+    """S7: fsync the directory entry too, not just the file's new bytes --
+    otherwise a power cut can keep the OLD name pointing at the old data
+    even though os.replace() "completed", on a filesystem that does not
+    journal the rename itself. POSIX only (Windows has no directory file
+    descriptor to fsync); a failure here (a filesystem that refuses it, a
+    permissions quirk) must never turn an already-successful write into a
+    reported one, so it is swallowed."""
+    if not hasattr(os, "O_DIRECTORY"):
+        return
+    try:
+        fd = os.open(folder, os.O_DIRECTORY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    except OSError:
+        pass
 
 
 def _uv_write_json(path, obj, fsync=True):
     """Write JSON so that a power cut leaves either the old file or the new
     one, never half of each: write a temp file in the same directory, push
-    it to the disk, then rename it over the target in one step.
-    fsync=False skips the per-file fsync (R1): uv_export writes several
-    small files per tap and a fsync each -- often a real disk wait -- adds
-    up to a freeze; os.replace() alone still keeps one file or the other
-    whole, just without the "flushed before the rename" guarantee, which a
-    one-off exported preset copy does not need."""
+    it to the disk, then rename it over the target in one step (and, for
+    fsync=True, fsync the directory entry too -- S7).
+    fsync=False skips the per-file fsync (R1/S2): save_cfg's toggle saves
+    and a preset ACTIVATE are on the Tk thread and happen far more often
+    than a deliberate SAVE/DELETE/EXPORT, so a real disk wait each tap adds
+    up to visible lag; os.replace() alone still keeps one file or the other
+    whole, just without the "flushed before the rename" guarantee.
+    S6: some restrictive setups cannot create a NEW file in the directory
+    at all (a sticky/read-only directory whose existing file is still
+    writable -- 6.1.0 always wrote straight to the target) even though the
+    directory itself is not read-only to os.makedirs; that failure -- and
+    only that one, not a failure of the write or the rename that follow,
+    which must still leave the old file untouched (R3) -- falls back to
+    writing path in place rather than losing the save."""
     folder = os.path.dirname(os.path.abspath(path))
     os.makedirs(folder, exist_ok=True)
     tmp = "{}.{}.tmp".format(path, os.getpid())
     try:
-        with open(tmp, "w", encoding="utf-8") as f:
+        tmp_file = open(tmp, "w", encoding="utf-8")
+    except OSError:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(obj, f, indent=1, allow_nan=False)
+            f.flush()
+            if fsync:
+                os.fsync(f.fileno())
+        return
+    try:
+        with tmp_file as f:
             json.dump(obj, f, indent=1, allow_nan=False)
             f.flush()
             if fsync:
@@ -3577,11 +3624,17 @@ def _uv_write_json(path, obj, fsync=True):
         except OSError:
             pass
         raise
+    if fsync:
+        _uv_fsync_dir(folder)
 
 
-def uv_presets_save(path, data):
+def uv_presets_save(path, data, fsync=True):
     """Atomically write the user presets (FACTORY is never stored).
-    Returns True on success, False on any failure; never raises."""
+    Returns True on success, False on any failure; never raises.
+    S2: fsync=False for a plain preset ACTIVATE (just a different "active"
+    id over the same presets, done on every tap of the preset list) --
+    SAVE and DELETE, which actually add or remove a preset, keep the
+    fsync=True default."""
     try:
         presets = [{"id": str(p["id"]), "name": str(p["name"]),
                     "created": str(p.get("created", "")),
@@ -3590,7 +3643,8 @@ def uv_presets_save(path, data):
         active = data.get("active", UV_FACTORY_ID)
         if active not in {p["id"] for p in presets}:
             active = UV_FACTORY_ID
-        _uv_write_json(path, {"version": 1, "active": active, "presets": presets})
+        _uv_write_json(path, {"version": 1, "active": active, "presets": presets},
+                       fsync=fsync)
         return True
     except Exception:
         return False
@@ -3681,10 +3735,12 @@ def uv_export(dest_dir, presets, toggles, now=None, sync=False):
     plus three extra keys UVScope ignores. Raises OSError on failure; the
     caller reports it. sync=True (a USB stick) flushes the kernel's write
     cache, so pulling the stick right after the toast loses nothing.
-    R1: individual files skip their own fsync (a preset count times a sync
-    disk wait is what froze the UI); the single os.sync() at the end still
-    flushes everything written here before the toast says it is safe to
-    pull the stick."""
+    S8: this already runs off the Tk thread (R1 moved EXPORT to a worker
+    thread rather than skipping its fsyncs), so each file's own fsync=True
+    no longer risks freezing the UI -- and skipping it meant a write error
+    on a failing/half-pulled stick could go unnoticed until the trailing
+    os.sync(), by which point EXPORT had already reported success; os.sync()
+    stays, but only as an optional final flush, not the sole error check."""
     tm = _uv_localtime(now)
     stamp_min = time.strftime("%Y%m%d-%H%M", tm)
     stamp_sec = time.strftime("%Y%m%d-%H%M%S", tm)
@@ -3710,7 +3766,7 @@ def uv_export(dest_dir, presets, toggles, now=None, sync=False):
             n += 1
         used.add(fname)
         path = os.path.join(dest_dir, fname)
-        _uv_write_json(path, d, fsync=False)
+        _uv_write_json(path, d, fsync=True)
         written.append(path)
         bundle.append(d)
     path = os.path.join(dest_dir, "uv_presets_all_{}.json".format(stamp_sec))
@@ -3719,7 +3775,7 @@ def uv_export(dest_dir, presets, toggles, now=None, sync=False):
                           "ref_short_side": UV_REF_SHORT_SIDE,
                           "toggles": {"boost": boost, "boxes": boxes,
                                       "filter": filt},
-                          "presets": bundle}, fsync=False)
+                          "presets": bundle}, fsync=True)
     written.append(path)
     if sync and hasattr(os, "sync"):
         os.sync()
@@ -3866,32 +3922,50 @@ class App:
         # plain picture. Only the three bar toggles are remembered, and a
         # hand-edited or damaged value falls back to its default.
         self.uv_mode = False
-        saved_uv = self.cfg.get("uv")
-        saved_uv = saved_uv if isinstance(saved_uv, dict) else {}
-        self.uv_opts = {}
-        for key, default in UV_OPT_DEFAULTS.items():
-            try:
-                self.uv_opts[key] = _uv_bool(saved_uv.get(key, default))
-            except (TypeError, ValueError, OverflowError):
-                self.uv_opts[key] = default
-        self.cfg["uv"] = dict(self.uv_opts)
-        # R6: read with .get(..., UV_TUNING_PANEL_DEFAULT), no setdefault --
-        # a setdefault would freeze today's True into self.cfg (and so into
-        # the next save_cfg) for every config that never set the key, and a
-        # later release build flipping the module constant to False would
-        # then have no effect on an installed Pi's existing config file.
+        # S1: every piece below reads either the config file or the presets
+        # file, both of which a hand edit (or a bug this hardening did not
+        # anticipate) can still make unusable in some way nothing above
+        # catches; wrapped as one block so startup falls back to the same
+        # FACTORY state a first boot gets rather than failing because of UV
+        # (the invariant in UV-PORT-PLAN.md S3.1 that UV can never take the
+        # whole app down -- this is that invariant applied to boot itself).
         try:
-            self.uv_tuning_panel = _uv_bool(
-                self.cfg.get("uv_tuning_panel", UV_TUNING_PANEL_DEFAULT))
-        except (TypeError, ValueError, OverflowError):
+            saved_uv = self.cfg.get("uv")
+            saved_uv = saved_uv if isinstance(saved_uv, dict) else {}
+            self.uv_opts = {}
+            for key, default in UV_OPT_DEFAULTS.items():
+                try:
+                    self.uv_opts[key] = _uv_bool(saved_uv.get(key, default))
+                except (TypeError, ValueError, OverflowError):
+                    self.uv_opts[key] = default
+            self.cfg["uv"] = dict(self.uv_opts)
+            # R6: read with .get(..., UV_TUNING_PANEL_DEFAULT), no setdefault
+            # -- a setdefault would freeze today's True into self.cfg (and so
+            # into the next save_cfg) for every config that never set the
+            # key, and a later release build flipping the module constant to
+            # False would then have no effect on an installed Pi's existing
+            # config file.
+            try:
+                self.uv_tuning_panel = _uv_bool(
+                    self.cfg.get("uv_tuning_panel", UV_TUNING_PANEL_DEFAULT))
+            except (TypeError, ValueError, OverflowError):
+                self.uv_tuning_panel = UV_TUNING_PANEL_DEFAULT
+            # Tuning presets (D11). The active preset survives a restart;
+            # unsaved drawer edits live only in self.uv_work and are dropped
+            # on a preset switch or a restart. A missing or damaged file
+            # simply means FACTORY.
+            self.uv_presets = uv_presets_load(UV_PRESETS_FILE)
+            self.uv_active_id = self.uv_presets["active"]
+            self.uv_work = self._uv_preset_params(self.uv_active_id)
+        except Exception:
+            traceback.print_exc(file=sys.stderr)
+            self.uv_opts = dict(UV_OPT_DEFAULTS)
+            self.cfg["uv"] = dict(self.uv_opts)
             self.uv_tuning_panel = UV_TUNING_PANEL_DEFAULT
+            self.uv_presets = {"version": 1, "active": UV_FACTORY_ID, "presets": []}
+            self.uv_active_id = UV_FACTORY_ID
+            self.uv_work = UVParams()
         self.uv_drawer_open = False     # never persisted: boots closed
-        # Tuning presets (D11). The active preset survives a restart; unsaved
-        # drawer edits live only in self.uv_work and are dropped on a preset
-        # switch or a restart. A missing or damaged file simply means FACTORY.
-        self.uv_presets = uv_presets_load(UV_PRESETS_FILE)
-        self.uv_active_id = self.uv_presets["active"]
-        self.uv_work = self._uv_preset_params(self.uv_active_id)
         self.uv_drawer = None           # the drawer Frame while it is on screen
         self.uv_dh = None               # its fixed header canvas
         self.uv_db = None               # its scrolling body canvas
@@ -3910,6 +3984,7 @@ class App:
         self._uv_del_until = 0.0        # DELETE armed ("CONFIRM?") until then
         self._uv_del_after = None
         self._uv_export_busy = False    # R1: EXPORT's worker thread running
+        self._uv_export_thread = None   # S9: joined briefly by quit()
         self._uv_ms = None              # last UV processing time
         self._uv_ms_t = 0.0
         self._uv_bar_state = "normal"
@@ -3923,8 +3998,14 @@ class App:
         self._uv_slow_run = 0           # consecutive frames over UV_SLOW_MS
         self._uv_slow = False           # perf guard tripped: analyse at 320 wide
         self._uv_err_t = -1e9           # monotonic time of the last error report
-        self.uv_proc = UVProcessor(self._uv_base_params())
-        self._uv_apply_opts()
+        try:
+            self.uv_proc = UVProcessor(self._uv_base_params())
+            self._uv_apply_opts()
+        except Exception:
+            traceback.print_exc(file=sys.stderr)
+            self.uv_work = UVParams()
+            self.uv_proc = UVProcessor(self.uv_work)
+            self._uv_apply_opts()
         # Up/down polarity, set once with FLIP U/D and never touched
         # by zeroing or by the axis detector.
         self.el_sign = 1.0 if self.cfg.get("el_sign", 1) > 0 else -1.0
@@ -4154,7 +4235,11 @@ class App:
             # R3: atomic (temp file + rename) through the same helper the UV
             # presets file uses, so a power cut mid-save can never leave a
             # half-written endoscope.json -- the old file survives instead.
-            _uv_write_json(CONFIG, out)
+            # S2: no fsync -- save_cfg runs on the Tk thread on every MIRROR/
+            # FLIP/UV tap, far more often than a deliberate preset SAVE, and
+            # os.replace() alone already keeps the old file or the new one
+            # whole (ext4's auto_da_alloc flushes a rename-over-existing).
+            _uv_write_json(CONFIG, out, fsync=False)
             self.cfg = out
         except Exception:
             pass
@@ -4729,7 +4814,7 @@ class App:
                                       state="hidden")
         self.hud.append(self.nosignal)
         if self.uv_mode:
-            self._uv_build_bar(pad, zero_w)
+            self._uv_build_bar(pad, zero_w, zero_h)
             if self.uv_tuning_panel:
                 # The arrow tab lives in the free strip between the indicator
                 # panel and ZERO / the option bar, clear of every button.
@@ -4784,68 +4869,126 @@ class App:
         # green from the grey, and when there is no picture behind the bar.
         return "✓ " + text if on else text
 
-    def _uv_build_bar(self, pad, zero_w):
+    def _uv_bar_rows_fit(self, rows, limit, gap):
+        """Largest (size, pad_x) from the standard MIRROR/FLIP shrink
+        sequence that keeps EVERY row of these buttons within limit px (one
+        shared size for a two-row bar, so it still reads as one control,
+        not two differently-sized ones); the narrowest tried, if none do.
+        Returns (size, pad_x, [(inner, widths, total), ...]) one tuple per
+        row, same order as `rows`."""
+        H = self.H
+        size0 = max(10, int(H / 38))
+        tries = [(size0, p) for p in (26, 20, 14)]
+        tries += [(s, 12) for s in range(size0 - 1, 7, -1)]
+        chosen = None
+        for size, pad_x in tries:
+            inner = max(4, size // 3)
+            per_row = []
+            for row in rows:
+                widths = [self.text_w(self._uv_label(n, True), size, True) + pad_x * 2
+                          for n in row]
+                total = sum(widths) + gap * (len(row) - 1) + inner * 2
+                per_row.append((inner, widths, total))
+            chosen = (size, pad_x, per_row)
+            if all(total <= limit for _, _, total in per_row):
+                break
+        return chosen
+
+    def _uv_build_bar(self, pad, zero_w, zero_h):
         """
         Lay out the UV option bar along the bottom, centred on the picture,
         above the status line and clear of ZERO. Only the labels are canvas
         items: a Tk canvas cannot draw a see-through rectangle, so the button
         backgrounds are blended into the video pixels by _uv_paint_bar --
         that is what keeps the picture visible through the bar.
+
+        S3: at 1024x600/800x480 (and every wider screen) this is exactly
+        the single centred row 6.1.0's bar always drew -- _uv_bar_rows_fit
+        runs the identical shrink loop over the identical sizes for a
+        single-row `rows`, and the clamp below is a no-op whenever that row
+        already fits centred (true of both geometries the existing tests
+        pin down, and of every screen wide enough to not need any of this).
+        A screen too narrow for that -- no font/padding shrink makes four
+        labels fit beside ZERO (or the open drawer) even off-centre --
+        drops to two rows of two instead. One too narrow even for that
+        (ZERO alone leaves less room than two buttons need at any size)
+        moves the whole bar above ZERO's top instead, since no horizontal
+        rearranging keeps two rectangles apart once both of their x-ranges
+        must reach into ZERO's.
         """
         W, H = self.W, self.H
         cx = self._video_rect()[0]
         gap = max(6, H // 100)
         bottom = H - pad - self.font_obj(max(8, H // 62)).metrics("linespace") - gap
-        right = W - pad - zero_w - gap
-        if self._uv_drawer_shown():
-            right = min(right, self._video_rect()[2] - gap)  # left of the drawer
-        half = min(cx - pad, right - cx)
+        right_zero = W - pad - zero_w - gap
+        # Left of the drawer when it is open -- never relaxed below (unlike
+        # ZERO, there is no "raise above it" that helps: the drawer already
+        # spans the full height of that side of the screen).
+        drawer_right = (self._video_rect()[2] - gap) if self._uv_drawer_shown() else (W - pad)
+        right = min(right_zero, drawer_right)
         self._uv_bar_state = "normal"
-        names =("boost", "boxes", "filter", "exit")
+        names = ("boost", "boxes", "filter", "exit")
         # Widths are measured WITH the check mark so the buttons never move
-        # when one is toggled. Start at the MIRROR/FLIP size and shrink the
-        # padding, then the font, until the bar fits a narrow screen.
-        size0 = max(10, int(H / 38))
-        tries = [(size0, p) for p in (26, 20, 14)]
-        tries += [(s, 12) for s in range(size0 - 1, 7, -1)]
-        for size, pad_x in tries:
-            inner = max(4, size // 3)
-            widths = [self.text_w(self._uv_label(n, True), size, True) + pad_x * 2
-                      for n in names]
-            total = sum(widths) + gap * (len(names) - 1) + inner * 2
-            if total <= 2 * half:
-                break
+        # when one is toggled.
+        half = min(cx - pad, right - cx)
+        size, pad_x, per_row = self._uv_bar_rows_fit([names], 2 * half, gap)
+        rows, total = [names], per_row[0][2]
+        if total > right - pad:
+            # Four buttons do not fit one row even off-centre -- two rows
+            # of two (EXIT/FILTER on the bottom row, nearest the thumb).
+            rows = [names[2:], names[:2]]
+            size, pad_x, per_row = self._uv_bar_rows_fit(rows, right - pad, gap)
+            if any(t > right - pad for _, _, t in per_row) and right_zero < drawer_right:
+                # Even two rows cannot clear ZERO's column at this width;
+                # dropping ZERO's own margin is the only width left to
+                # recover, so the whole bar moves above ZERO's row instead
+                # of trying (and failing) to also dodge it sideways.
+                size, pad_x, per_row = self._uv_bar_rows_fit(rows, drawer_right - pad, gap)
+                right = drawer_right
+                bottom = min(bottom, H - pad - zero_h - gap)
         bh = size * 2 + 30
-        x = int(round(cx - total / 2.0))
-        # R8: cx is centred on the picture, which on a small or portrait
-        # screen (640x480 with the drawer open, 480x800) can sit close
-        # enough to one edge that the centred bar runs off-screen even
-        # after the shrink loop above; pin it back inside the margins.
-        x = max(pad, min(x, W - pad - total))
+        row_gap = max(4, gap // 2)
         y1 = int(bottom)
-        self.uv_bar_box = (x, y1 - bh - inner * 2, x + total, y1)
+        boxes = []
+        for row, (inner, widths, rtotal) in zip(rows, per_row):
+            x = int(round(cx - rtotal / 2.0))
+            # cx is centred on the picture, which on a small or portrait
+            # screen can sit close enough to one edge that the centred row
+            # runs off-screen; pin it back inside the margins (a no-op
+            # whenever the row already fits centred, see the docstring).
+            x = max(pad, min(x, right - rtotal))
+            boxes.append((x, y1 - bh - inner * 2, x + rtotal, y1))
+            x += inner
+            for name, w in zip(row, widths):
+                bx0, by0, bx1, by1 = x, y1 - inner - bh, x + w, y1 - inner
+                # Per-button background, in the same order as self.uv_bar
+                # (uv_toggle()/_uv_build_bar's own caller rely on
+                # self.uv_bar_bg[1:] lining up with self.uv_bar one-to-one;
+                # the single whole-bar backdrop behind all of them is
+                # appended at index 0 once every row is placed, below).
+                self.uv_bar_bg.append(self.canvas.create_rectangle(
+                    bx0, by0, bx1, by1, outline="", width=0,
+                    fill=self._uv_over_bg(*self._uv_bar_colour(name))))
+                t = self.canvas.create_text((bx0 + bx1) / 2.0, (by0 + by1) / 2.0,
+                                            text=self._uv_label(name),
+                                            fill="white", font=self.f(size, True))
+                self.hud.append(t)
+                self.uv_bar.append((name, bx0, by0, bx1, by1, t))
+                x = bx1 + gap
+            y1 = boxes[-1][1] - row_gap      # the next row (if any) sits above this one
+        self.uv_bar_box = (min(b[0] for b in boxes), min(b[1] for b in boxes),
+                           max(b[2] for b in boxes), max(b[3] for b in boxes))
         # Where the picture does NOT reach under the bar (a picture shrunk
-        # beside the open tuning drawer, or no signal at all), these plain
-        # rectangles show the same blend over the black background. They
-        # sit BELOW the video image, so wherever the picture is, its own
+        # beside the open tuning drawer, or no signal at all), this plain
+        # rectangle (the whole bar's bounding box, covering the gap between
+        # two rows too) shows the same blend over the black background. It
+        # sits BELOW the video image, so wherever the picture is, its own
         # blended pixels win and the bar looks the same everywhere.
-        self.uv_bar_bg = [self.canvas.create_rectangle(
+        self.uv_bar_bg.insert(0, self.canvas.create_rectangle(
             *self.uv_bar_box, outline="", width=0,
-            fill=self._uv_over_bg(*self._uv_bar_colour(None)))]
-        x += inner
-        for name, w in zip(names, widths):
-            bx0, by0, bx1, by1 = x, y1 - inner - bh, x + w, y1 - inner
-            self.uv_bar_bg.append(self.canvas.create_rectangle(
-                bx0, by0, bx1, by1, outline="", width=0,
-                fill=self._uv_over_bg(*self._uv_bar_colour(name))))
-            t = self.canvas.create_text((bx0 + bx1) / 2.0, (by0 + by1) / 2.0,
-                                        text=self._uv_label(name),
-                                        fill="white", font=self.f(size, True))
-            self.hud.append(t)
-            self.uv_bar.append((name, bx0, by0, bx1, by1, t))
-            x = bx1 + gap
+            fill=self._uv_over_bg(*self._uv_bar_colour(None))))
         self.stage_items.extend(self.uv_bar_bg)
-        for r in reversed(self.uv_bar_bg):  # backdrop ends up undermost
+        for r in reversed(self.uv_bar_bg):  # the backdrop ends up undermost
             self.canvas.tag_lower(r)
 
     def _uv_bar_colour(self, name):
@@ -5298,7 +5441,19 @@ class App:
                                              text="", fill="#b39ddb",
                                              font=self.f(fs + 1, True), tags=tag)
                 y += lh
+                kr = max(8, int(u * 0.3))
                 bw = int(u * 1.15)
+                # S4: shrink the -/+ buttons (never the track) when a
+                # narrow drawer would otherwise leave less than a usable
+                # 20 px between them -- R8 kept the DRAWN track at that
+                # 20 px floor without ever touching bw, so on a narrow
+                # enough drawer the floor pushed the drawn rectangle past
+                # the "between the buttons" strip the hit-test below still
+                # used, and that overrun hit-tested as "plus" instead of
+                # "track".
+                room = w - 4 * m - 2 * kr - 20
+                if room < 2 * bw:
+                    bw = max(16, room // 2)
                 for key, x0, glyph in (("minus", m, "−"),
                                        ("plus", w - m - bw, "+")):
                     self._uv_round_rect(c, x0, y, x0 + bw, y + u, 8,
@@ -5307,7 +5462,6 @@ class App:
                                   fill="white", font=self.f(k["fpm"], True),
                                   tags=tag)
                     self._uv_hits.append((x0, y, x0 + bw, y + u, key, field))
-                kr = max(8, int(u * 0.3))
                 tx0 = m + bw + m + kr
                 # R8: on a narrow drawer (small screen, panel_w floored at
                 # 300 but still tight once the -/+ buttons and knob radius
@@ -5419,8 +5573,17 @@ class App:
             self._uv_scroll_to(d["off"] - (e.y - d["y"]))
 
     def _uv_body_release(self, e):
+        # S5: a tap only acts if the finger is still over where it pressed --
+        # a fast swipe that never crosses UV_DRAG_SLOP (so _uv_body_motion
+        # never ran and "mode" is still "tap") used to act on release
+        # anyway, wherever that release happened to land; this mirrors the
+        # press/release distance (and target) check _uv_head_release
+        # already made for SAVE/DELETE/EXPORT/the preset list's own header.
         d, self._uv_drag = self._uv_drag, None
         if not d or d["mode"] != "tap" or not d["hit"]:
+            return
+        if (abs(e.x - d["x"]) > UV_DRAG_SLOP or abs(e.y - d["y"]) > UV_DRAG_SLOP
+                or self._uv_body_target(e.x, e.y) != d["hit"]):
             return
         kind, key = d["hit"]
         if kind == "track":
@@ -5619,7 +5782,10 @@ class App:
         self.uv_presets["active"] = self.uv_active_id
         self.uv_work = self._uv_preset_params(self.uv_active_id)
         if persist and (known or os.path.exists(UV_PRESETS_FILE)):
-            if not uv_presets_save(UV_PRESETS_FILE, self.uv_presets):
+            # S2: no fsync -- activating a preset only changes which id is
+            # "active" over the same already-saved presets, and happens on
+            # every tap of the list, not just a deliberate SAVE/DELETE.
+            if not uv_presets_save(UV_PRESETS_FILE, self.uv_presets, fsync=False):
                 self.toast("PRESET CHOICE NOT SAVED", WARN, ms=2000)
         self._uv_list_open = False
         self._uv_del_disarm(refresh=False)
@@ -5701,27 +5867,39 @@ class App:
         outcome is the single handoff from that thread to _uv_export_poll,
         passed through root.after rather than kept on self (plain dict
         set/get is enough -- one writer, one reader, never both at once).
-        The worker touches no Tk object."""
+        The worker touches no Tk object.
+        S11: everything from here down to scheduling the poll is wrapped --
+        a failure building `presets`, starting the thread, or scheduling
+        root.after must still clear the busy flag and toast a failure
+        instead of leaving EXPORT stuck busy forever (or raising into the
+        button's click handler)."""
         if self._uv_export_busy:
             self.toast("EXPORT BUSY", WARN, ms=1200)
             return
         self._uv_export_busy = True
-        self.toast("EXPORTING…", OK, ms=30000)      # replaced by the result below
-        presets = [{"name": UV_FACTORY_NAME, "params": UVParams()}] + [
-            {"name": p["name"], "params": p["params"]}
-            for p in self.uv_presets["presets"]]
-        toggles = dict(self.uv_opts)
-        outcome = {}
+        try:
+            self.toast("EXPORTING…", OK, ms=30000)  # replaced by the result below
+            presets = [{"name": UV_FACTORY_NAME, "params": UVParams()}] + [
+                {"name": p["name"], "params": p["params"]}
+                for p in self.uv_presets["presets"]]
+            toggles = dict(self.uv_opts)
+            outcome = {}
 
-        def worker():
-            try:
-                dest, usb = uv_find_export_dir(media_root=UV_MEDIA_ROOT)
-                paths = uv_export(dest, presets, toggles, time.time(), sync=usb)
-                outcome["ok"] = (dest, usb, paths)
-            except Exception:
-                outcome["err"] = traceback.format_exc()
-        threading.Thread(target=worker, daemon=True).start()
-        self.root.after(150, self._uv_export_poll, outcome)
+            def worker():
+                try:
+                    dest, usb = uv_find_export_dir(media_root=UV_MEDIA_ROOT)
+                    paths = uv_export(dest, presets, toggles, time.time(), sync=usb)
+                    outcome["ok"] = (dest, usb, paths)
+                except Exception:
+                    outcome["err"] = traceback.format_exc()
+            # S9: kept so quit() can join it if EXIT lands mid-export.
+            self._uv_export_thread = threading.Thread(target=worker, daemon=True)
+            self._uv_export_thread.start()
+            self.root.after(150, self._uv_export_poll, outcome)
+        except Exception:
+            traceback.print_exc(file=sys.stderr)
+            self._uv_export_busy = False
+            self.toast("EXPORT FAILED", ALERT, ms=2500)
 
     def _uv_export_poll(self, outcome):
         """Tk-thread side of EXPORT (R1): called only via root.after, so it
@@ -6436,7 +6614,8 @@ class App:
         t = c.create_text(x + w / 2, y + h / 2, text=label, fill="white",
                           font=self.f(max(10, int(self.H / 48)), True))
         for item in (r, t):
-            c.tag_bind(item, "<Button-1>", lambda e: cb())
+            funcid = c.tag_bind(item, "<Button-1>", lambda e: cb())
+            self._item_binds.append((item, funcid))   # S10: see button()/R5
         self.stage_items.extend((r, t))
 
     def tune_bars(self):
@@ -6944,7 +7123,8 @@ class App:
                                     fill="white",
                                     font=self.f(max(11, int(h * 0.34)), True))
         for item in (r, t):
-            self.canvas.tag_bind(item, "<Button-1>", lambda e: cb())
+            funcid = self.canvas.tag_bind(item, "<Button-1>", lambda e: cb())
+            self._item_binds.append((item, funcid))   # S10: see button()/R5
         store.extend([r, t])
         return r, t
 
@@ -7228,6 +7408,20 @@ class App:
             except Exception:
                 pass
             self.log = None
+        # S9: EXPORT writes on its own daemon thread (R1) -- destroying root
+        # out from under it leaves the operator with no feedback at all and
+        # a write racing the exit-watchdog below instead of finishing. Give
+        # it a few seconds to land normally before tearing anything down;
+        # the watchdog still guarantees the process does not hang on it.
+        if self._uv_export_busy:
+            self.toast("FINISHING EXPORT…", OK, ms=3000)
+            try:
+                self.root.update()      # so the toast actually paints first
+            except Exception:
+                pass
+            thread = self._uv_export_thread
+            if thread is not None:
+                thread.join(3.0)
         # Backstop. If anything in the shutdown path blocks -- most often the
         # reader thread sitting inside a V4L2 select -- the process still ends
         # on time, and the camera is free for the next launch. Without this the

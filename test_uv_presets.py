@@ -227,6 +227,143 @@ def test_save_roundtrip_and_atomic(mod):
           "atomic (failed rename keeps the old file, no temp left), failures return False")
 
 
+# ------------------------------------------- second-round fixes (item 7d)
+def test_load_unhashable_active(mod):
+    """S1: "active" is checked for its type before the `in seen` membership
+    test. A set membership test on an unhashable value (a list or a dict --
+    valid JSON, just not a valid preset id) used to raise TypeError there,
+    which crashed App.__init__ before this fix even though every preset
+    entry itself was perfectly fine and every OTHER guard here already
+    passed."""
+    d = fresh("active_type")
+    good = entry(mod, "pA", "good", "2026-10-07T00:00:00")
+    for bad_active in ([], {}, {"x": 1}, 5, 5.5, True, None):
+        p = d / "p.json"
+        p.write_text(json.dumps({"version": 1, "active": bad_active,
+                                 "presets": [good]}), encoding="utf-8")
+        data = mod.uv_presets_load(str(p))                  # must not raise
+        assert data["active"] == "factory", (bad_active, data)
+        assert [e["id"] for e in data["presets"]] == ["pA"], (
+            "an unrelated bad 'active' must not drop the good presets")
+    print("PASS: LOAD UNHASHABLE ACTIVE -- a list/dict/other non-string 'active' "
+          "never raises and falls back to FACTORY without losing the saved presets")
+
+
+def test_activate_skips_fsync(mod):
+    """S2: uv_presets_save(..., fsync=False) (what _uv_activate calls, since
+    activating a preset only changes which id is "active" over the same
+    already-saved presets, and happens on every tap of the list) really
+    does skip the per-file fsync, while the default (what SAVE/DELETE use)
+    still fsyncs -- unchanged from R1/test_save_roundtrip_and_atomic."""
+    d = fresh("activate_fsync")
+    p = d / "presets.json"
+    data = {"version": 1, "active": "pA", "presets": [
+        entry(mod, "pA", "a", "2026-10-07T00:00:00")]}
+    fsyncs = []
+    real_fsync = mod.os.fsync
+    mod.os.fsync = lambda fd: (fsyncs.append(1), real_fsync(fd))[-1]
+    try:
+        assert mod.uv_presets_save(str(p), data, fsync=False) is True
+        assert fsyncs == [], "preset ACTIVATE must not fsync (S2)"
+        assert mod.uv_presets_save(str(p), data) is True        # default
+        assert fsyncs == [1], "SAVE/DELETE must still fsync"
+    finally:
+        mod.os.fsync = real_fsync
+    assert json.loads(p.read_text(encoding="utf-8"))["active"] == "pA"
+    print("PASS: ACTIVATE SKIPS FSYNC -- fsync=False really does skip the per-file fsync, "
+          "the fsync=True default (SAVE/DELETE) is unchanged")
+
+
+def test_atomic_write_fallback(mod):
+    """S6: when the temp file itself cannot be created (a sticky/read-only
+    directory that still allows overwriting an existing file -- exactly
+    what 6.1.0's own direct, non-atomic write always tolerated), the write
+    must not be lost: _uv_write_json falls back to writing the target in
+    place. A failure anywhere else (the write itself, the rename) is a
+    separate matter (test_save_roundtrip_and_atomic covers os.replace) and
+    must NOT take this fallback -- it would turn a real failure into a
+    silent, non-atomic overwrite."""
+    import builtins
+    d = fresh("fallback")
+    target = d / "cfg.json"
+    target.write_text(json.dumps({"old": True}), encoding="utf-8")
+    real_open = builtins.open
+
+    def flaky_open(file, mode="r", *a, **kw):
+        if "w" in mode and ".tmp" in os.path.basename(str(file)):
+            raise OSError("directory refuses new files")
+        return real_open(file, mode, *a, **kw)
+    builtins.open = flaky_open
+    try:
+        mod._uv_write_json(str(target), {"new": True})      # must not raise
+    finally:
+        builtins.open = real_open
+    assert json.loads(target.read_text(encoding="utf-8")) == {"new": True}
+    assert sorted(p.name for p in d.iterdir()) == ["cfg.json"], (
+        "no temp file left behind by the fallback")
+    print("PASS: ATOMIC WRITE FALLBACK -- a directory that refuses to create a new file "
+          "(but still allows overwriting the existing one) falls back to a direct write "
+          "instead of losing the save, with no stray temp file")
+
+
+def test_dir_fsync_after_replace(mod):
+    """S7: a successful fsync=True write also fsyncs the directory entry
+    after the rename (POSIX only -- Windows, where this test runs, has no
+    os.O_DIRECTORY, so the real call is a no-op there; os.O_DIRECTORY is
+    faked in just for this test to exercise the POSIX branch the way a
+    Linux box runs it). A failure doing so (an unsupported filesystem, a
+    permissions quirk) must never turn an already-successful write into a
+    reported one."""
+    d = fresh("dirfsync")
+    p = d / "x.json"
+    had_flag = hasattr(mod.os, "O_DIRECTORY")
+    if not had_flag:
+        mod.os.O_DIRECTORY = 0x10000            # Linux's actual value; unused as a number here
+    real_open, real_fsync, real_close = mod.os.open, mod.os.fsync, mod.os.close
+    dir_opens, dir_fsyncs = [], []
+
+    def fake_open(path, flags):
+        if flags == mod.os.O_DIRECTORY:
+            dir_opens.append(path)
+            return -99
+        return real_open(path, flags)
+
+    def fake_fsync(fd):
+        if fd == -99:
+            dir_fsyncs.append(fd)
+            return
+        real_fsync(fd)
+
+    def fake_close(fd):
+        if fd != -99:
+            real_close(fd)
+    mod.os.open, mod.os.fsync, mod.os.close = fake_open, fake_fsync, fake_close
+    try:
+        mod._uv_write_json(str(p), {"a": 1})
+        assert dir_opens == [str(d)], dir_opens
+        assert dir_fsyncs == [-99]
+        # fsync=False must not touch the directory at all.
+        dir_opens.clear()
+        mod._uv_write_json(str(p), {"b": 2}, fsync=False)
+        assert dir_opens == []
+        # A failure fsyncing the directory is swallowed -- the file itself
+        # already landed, so this must not be reported as a failed write.
+        def failing_open(path, flags):
+            if flags == mod.os.O_DIRECTORY:
+                raise OSError("fsync not supported on this filesystem")
+            return real_open(path, flags)
+        mod.os.open = failing_open
+        mod._uv_write_json(str(p), {"c": 3})              # must not raise
+        assert json.loads(p.read_text(encoding="utf-8")) == {"c": 3}
+    finally:
+        mod.os.open, mod.os.fsync, mod.os.close = real_open, real_fsync, real_close
+        if not had_flag:
+            del mod.os.O_DIRECTORY
+    print("PASS: DIR FSYNC -- the directory entry is fsynced after a successful fsync=True "
+          "rename (skipped for fsync=False), and a failure doing so never turns an "
+          "already-written file into a reported failure")
+
+
 # --------------------------------------------------------------- naming
 def test_naming(mod):
     t = datetime.datetime(2026, 10, 7, 14, 32, 59)
@@ -341,20 +478,23 @@ def test_export_files(mod):
     had_sync = hasattr(mod.os, "sync")
     real_sync = getattr(mod.os, "sync", None)
     mod.os.sync = lambda: calls.append(1)
-    # R1: EXPORT must not fsync every one of the (preset count + 1) files --
-    # that is a real disk wait per file, which is what froze the touch UI.
-    # Only the single trailing os.sync() (checked above, USB only) still
-    # guarantees everything is flushed before the "safe to unplug" toast.
+    # S8: EXPORT runs off the Tk thread (R1 moved it to a worker thread, not
+    # by skipping fsyncs), so each file IS fsynced -- a write error on a
+    # failing/half-pulled stick must surface as EXPORT FAILED, not a false
+    # success papered over until the trailing os.sync() (checked above, USB
+    # only), which is now just an optional final flush on top of that.
     fsyncs = []
     real_fsync = mod.os.fsync
     mod.os.fsync = lambda fd: (fsyncs.append(1), real_fsync(fd))[-1]
     try:
         paths = mod.uv_export(str(d), presets, toggles, t, sync=True)
         assert calls == [1]
-        assert fsyncs == [], "uv_export must skip the per-file fsync (R1)"
-        mod.uv_export(str(d / "nosync"), presets[:1], toggles, t)
+        assert fsyncs == [1] * len(paths), (
+            "uv_export must fsync every file (S8)", fsyncs, len(paths))
+        fsyncs.clear()
+        paths2 = mod.uv_export(str(d / "nosync"), presets[:1], toggles, t)
         assert calls == [1]
-        assert fsyncs == []
+        assert fsyncs == [1] * len(paths2)
     finally:
         if had_sync:
             mod.os.sync = real_sync
@@ -441,6 +581,10 @@ def main():
     test_load_keeps_order_with_backwards_clock(mod)
     test_load_nan_and_ranges(mod)
     test_save_roundtrip_and_atomic(mod)
+    test_load_unhashable_active(mod)
+    test_activate_skips_fsync(mod)
+    test_atomic_write_fallback(mod)
+    test_dir_fsync_after_replace(mod)
     test_naming(mod)
     test_export_dir(mod)
     paths = test_export_files(mod)
