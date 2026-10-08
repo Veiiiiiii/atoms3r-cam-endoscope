@@ -3562,14 +3562,23 @@ def uv_presets_load(path):
         return {"version": 1, "active": UV_FACTORY_ID, "presets": []}
 
 
+_UV_FSYNC_DIR_UNSUPPORTED = {errno.EINVAL, errno.EBADF, errno.EISDIR}
+for _uv_errno_name in ("ENOTSUP", "EOPNOTSUPP"):
+    if hasattr(errno, _uv_errno_name):
+        _UV_FSYNC_DIR_UNSUPPORTED.add(getattr(errno, _uv_errno_name))
+del _uv_errno_name
+
+
 def _uv_fsync_dir(folder):
     """S7: fsync the directory entry too, not just the file's new bytes --
     otherwise a power cut can keep the OLD name pointing at the old data
     even though os.replace() "completed", on a filesystem that does not
     journal the rename itself. POSIX only (Windows has no directory file
-    descriptor to fsync); a failure here (a filesystem that refuses it, a
-    permissions quirk) must never turn an already-successful write into a
-    reported one, so it is swallowed."""
+    descriptor to fsync); only an error meaning "fsyncing a directory is
+    not a thing here" (EINVAL/ENOTSUP/EOPNOTSUPP/EBADF/EISDIR, or the
+    Windows case where os.O_DIRECTORY does not even exist) is swallowed --
+    a real I/O error (e.g. EIO) must propagate so EXPORT/SAVE report
+    failure instead of silently skipping the durability guarantee."""
     if not hasattr(os, "O_DIRECTORY"):
         return
     try:
@@ -3578,8 +3587,10 @@ def _uv_fsync_dir(folder):
             os.fsync(fd)
         finally:
             os.close(fd)
-    except OSError:
-        pass
+    except OSError as e:
+        if e.errno in _UV_FSYNC_DIR_UNSUPPORTED:
+            return
+        raise
 
 
 def _uv_write_json(path, obj, fsync=True):
@@ -3596,15 +3607,19 @@ def _uv_write_json(path, obj, fsync=True):
     at all (a sticky/read-only directory whose existing file is still
     writable -- 6.1.0 always wrote straight to the target) even though the
     directory itself is not read-only to os.makedirs; that failure -- and
-    only that one, not a failure of the write or the rename that follow,
-    which must still leave the old file untouched (R3) -- falls back to
-    writing path in place rather than losing the save."""
+    only a PERMISSION failure (EACCES/EPERM), not e.g. a full disk
+    (ENOSPC/EDQUOT), which must not truncate the existing good file --
+    falls back to writing path in place rather than losing the save. Any
+    other failure to create the temp file propagates so the caller sees it
+    and the original file is left untouched (R3)."""
     folder = os.path.dirname(os.path.abspath(path))
     os.makedirs(folder, exist_ok=True)
     tmp = "{}.{}.tmp".format(path, os.getpid())
     try:
         tmp_file = open(tmp, "w", encoding="utf-8")
-    except OSError:
+    except OSError as e:
+        if not isinstance(e, PermissionError) and e.errno not in (errno.EACCES, errno.EPERM):
+            raise
         with open(path, "w", encoding="utf-8") as f:
             json.dump(obj, f, indent=1, allow_nan=False)
             f.flush()

@@ -25,6 +25,40 @@ from pathlib import Path
 
 import numpy as np
 
+def patch_fsync(mod):
+    """Track per-file fsync calls separately from the directory fsync
+    (_uv_fsync_dir, S7), so fsync-count assertions are platform independent:
+    on Linux _uv_write_json's fsync=True path ALSO fsyncs the directory
+    entry, which would inflate a plain os.fsync count there but not on
+    Windows (no os.O_DIRECTORY, so _uv_fsync_dir is already a no-op) --
+    the tests here run on Windows but must hold on the Pi too. Stubbing
+    out _uv_fsync_dir itself (rather than letting it run and go through
+    the same os.fsync mock) keeps file_fsyncs counting only the per-file
+    fsync regardless of platform, while dir_calls records whether the
+    directory fsync was invoked at all. Returns (file_fsyncs, dir_calls,
+    restore)."""
+    real_fsync = mod.os.fsync
+    real_dir_fsync = mod._uv_fsync_dir
+    file_fsyncs = []
+    dir_calls = []
+
+    def fake_fsync(fd):
+        file_fsyncs.append(1)
+        return real_fsync(fd)
+
+    def fake_dir_fsync(folder):
+        dir_calls.append(folder)
+
+    mod.os.fsync = fake_fsync
+    mod._uv_fsync_dir = fake_dir_fsync
+
+    def restore():
+        mod.os.fsync = real_fsync
+        mod._uv_fsync_dir = real_dir_fsync
+
+    return file_fsyncs, dir_calls, restore
+
+
 HERE = Path(__file__).resolve().parent
 TMP = Path(tempfile.mkdtemp(prefix="test_uv_presets_"))
 UVSCOPE_CORE = Path(r"C:\Users\weic\OneDrive - Innova Electronics Corp\Desktop"
@@ -184,14 +218,16 @@ def test_save_roundtrip_and_atomic(mod):
         entry(mod, "factory", "FACTORY", "", exposure=2.0)]}  # never stored
     # uv_presets_save (unlike uv_export, R1) still fsyncs: _uv_write_json's
     # fsync=True default is untouched for every caller except uv_export.
-    fsyncs = []
-    real_fsync = mod.os.fsync
-    mod.os.fsync = lambda fd: (fsyncs.append(1), real_fsync(fd))[-1]
+    # (The per-file fsync is counted separately from the directory fsync --
+    # S7 -- so this holds on Linux, where a durable write also fsyncs the
+    # directory entry, not just on Windows where that part is a no-op.)
+    fsyncs, dir_calls, restore_fsync = patch_fsync(mod)
     try:
         assert mod.uv_presets_save(str(p), data) is True
     finally:
-        mod.os.fsync = real_fsync
+        restore_fsync()
     assert fsyncs == [1], fsyncs
+    assert len(dir_calls) == 1, dir_calls
     stored = json.loads(p.read_text(encoding="utf-8"))
     assert stored["version"] == 1 and stored["active"] == "pB"
     assert [e["id"] for e in stored["presets"]] == ["pB", "pA"]
@@ -259,41 +295,48 @@ def test_activate_skips_fsync(mod):
     p = d / "presets.json"
     data = {"version": 1, "active": "pA", "presets": [
         entry(mod, "pA", "a", "2026-10-07T00:00:00")]}
-    fsyncs = []
-    real_fsync = mod.os.fsync
-    mod.os.fsync = lambda fd: (fsyncs.append(1), real_fsync(fd))[-1]
+    fsyncs, dir_calls, restore_fsync = patch_fsync(mod)
     try:
         assert mod.uv_presets_save(str(p), data, fsync=False) is True
         assert fsyncs == [], "preset ACTIVATE must not fsync (S2)"
+        assert dir_calls == [], "preset ACTIVATE must not fsync the directory either (S2)"
         assert mod.uv_presets_save(str(p), data) is True        # default
         assert fsyncs == [1], "SAVE/DELETE must still fsync"
+        assert len(dir_calls) == 1, "SAVE/DELETE must still fsync the directory (S7)"
     finally:
-        mod.os.fsync = real_fsync
+        restore_fsync()
     assert json.loads(p.read_text(encoding="utf-8"))["active"] == "pA"
     print("PASS: ACTIVATE SKIPS FSYNC -- fsync=False really does skip the per-file fsync, "
           "the fsync=True default (SAVE/DELETE) is unchanged")
 
 
 def test_atomic_write_fallback(mod):
-    """S6: when the temp file itself cannot be created (a sticky/read-only
-    directory that still allows overwriting an existing file -- exactly
-    what 6.1.0's own direct, non-atomic write always tolerated), the write
-    must not be lost: _uv_write_json falls back to writing the target in
-    place. A failure anywhere else (the write itself, the rename) is a
-    separate matter (test_save_roundtrip_and_atomic covers os.replace) and
-    must NOT take this fallback -- it would turn a real failure into a
-    silent, non-atomic overwrite."""
+    """S6: when the temp file itself cannot be created because of a
+    PERMISSION problem (a sticky/read-only directory that still allows
+    overwriting an existing file -- exactly what 6.1.0's own direct,
+    non-atomic write always tolerated), the write must not be lost:
+    _uv_write_json falls back to writing the target in place. A failure
+    anywhere else (the write itself, the rename, or a temp-file-create
+    failure that is NOT a permission problem -- e.g. a full disk) is a
+    separate matter and must NOT take this fallback -- it would turn a
+    real failure (or, on a full disk, truncate the existing good file)
+    into a silent, non-atomic overwrite."""
     import builtins
+    import errno as errno_mod
     d = fresh("fallback")
     target = d / "cfg.json"
     target.write_text(json.dumps({"old": True}), encoding="utf-8")
     real_open = builtins.open
 
-    def flaky_open(file, mode="r", *a, **kw):
-        if "w" in mode and ".tmp" in os.path.basename(str(file)):
-            raise OSError("directory refuses new files")
-        return real_open(file, mode, *a, **kw)
-    builtins.open = flaky_open
+    def make_flaky_open(exc):
+        def flaky_open(file, mode="r", *a, **kw):
+            if "w" in mode and ".tmp" in os.path.basename(str(file)):
+                raise exc
+            return real_open(file, mode, *a, **kw)
+        return flaky_open
+
+    # EACCES -> permission problem -> falls back to an in-place write.
+    builtins.open = make_flaky_open(PermissionError(errno_mod.EACCES, "permission denied"))
     try:
         mod._uv_write_json(str(target), {"new": True})      # must not raise
     finally:
@@ -301,9 +344,43 @@ def test_atomic_write_fallback(mod):
     assert json.loads(target.read_text(encoding="utf-8")) == {"new": True}
     assert sorted(p.name for p in d.iterdir()) == ["cfg.json"], (
         "no temp file left behind by the fallback")
-    print("PASS: ATOMIC WRITE FALLBACK -- a directory that refuses to create a new file "
-          "(but still allows overwriting the existing one) falls back to a direct write "
-          "instead of losing the save, with no stray temp file")
+
+    # EPERM (a plain OSError, not necessarily a PermissionError subclass on
+    # every platform) -> also a permission problem -> also falls back.
+    builtins.open = make_flaky_open(OSError(errno_mod.EPERM, "operation not permitted"))
+    try:
+        mod._uv_write_json(str(target), {"newer": True})
+    finally:
+        builtins.open = real_open
+    assert json.loads(target.read_text(encoding="utf-8")) == {"newer": True}
+
+    # ENOSPC (full disk) -> NOT a permission problem -> must propagate,
+    # and the original good file must be left completely untouched.
+    before = target.read_bytes()
+    builtins.open = make_flaky_open(OSError(errno_mod.ENOSPC, "no space left on device"))
+    try:
+        try:
+            mod._uv_write_json(str(target), {"lost": True})
+            raised = False
+        except OSError:
+            raised = True
+    finally:
+        builtins.open = real_open
+    assert raised, "a full disk must propagate, not silently fall back"
+    assert target.read_bytes() == before, "original file must be untouched on ENOSPC"
+    # And the caller (uv_presets_save) reports this as a failure, not a
+    # crash and not a false success.
+    assert mod.uv_presets_save(str(target), {"active": "x", "presets": []}) is True
+    builtins.open = make_flaky_open(OSError(errno_mod.ENOSPC, "no space left on device"))
+    try:
+        ok = mod.uv_presets_save(str(target), {"active": "x", "presets": []})
+    finally:
+        builtins.open = real_open
+    assert ok is False, "ENOSPC creating the temp file must report failure"
+    print("PASS: ATOMIC WRITE FALLBACK -- a PERMISSION problem creating the temp file "
+          "(EACCES/EPERM) falls back to a direct write with no stray temp file, while a "
+          "non-permission failure (ENOSPC) propagates/reports failure and leaves the "
+          "existing good file untouched")
 
 
 def test_dir_fsync_after_replace(mod):
@@ -311,9 +388,10 @@ def test_dir_fsync_after_replace(mod):
     after the rename (POSIX only -- Windows, where this test runs, has no
     os.O_DIRECTORY, so the real call is a no-op there; os.O_DIRECTORY is
     faked in just for this test to exercise the POSIX branch the way a
-    Linux box runs it). A failure doing so (an unsupported filesystem, a
-    permissions quirk) must never turn an already-successful write into a
-    reported one."""
+    Linux box runs it). An error meaning "fsyncing a directory just isn't
+    a thing here" (EINVAL and friends) must never turn an already-
+    successful write into a reported one -- but a real I/O error (EIO)
+    is not that, and must propagate so EXPORT/SAVE report failure."""
     d = fresh("dirfsync")
     p = d / "x.json"
     had_flag = hasattr(mod.os, "O_DIRECTORY")
@@ -346,15 +424,29 @@ def test_dir_fsync_after_replace(mod):
         dir_opens.clear()
         mod._uv_write_json(str(p), {"b": 2}, fsync=False)
         assert dir_opens == []
-        # A failure fsyncing the directory is swallowed -- the file itself
-        # already landed, so this must not be reported as a failed write.
-        def failing_open(path, flags):
-            if flags == mod.os.O_DIRECTORY:
-                raise OSError("fsync not supported on this filesystem")
-            return real_open(path, flags)
-        mod.os.open = failing_open
+        # An "unsupported here" failure fsyncing the directory is swallowed
+        # -- the file itself already landed, so this must not be reported
+        # as a failed write.
+        import errno as errno_mod
+
+        def make_failing_open(exc):
+            def failing_open(path, flags):
+                if flags == mod.os.O_DIRECTORY:
+                    raise exc
+                return real_open(path, flags)
+            return failing_open
+        mod.os.open = make_failing_open(OSError(errno_mod.EINVAL, "fsync not supported here"))
         mod._uv_write_json(str(p), {"c": 3})              # must not raise
         assert json.loads(p.read_text(encoding="utf-8")) == {"c": 3}
+        # But a REAL I/O error fsyncing the directory is not "unsupported"
+        # and must propagate.
+        mod.os.open = make_failing_open(OSError(errno_mod.EIO, "I/O error"))
+        try:
+            mod._uv_write_json(str(p), {"d": 4})
+            raised = False
+        except OSError:
+            raised = True
+        assert raised, "a real I/O error fsyncing the directory must propagate"
     finally:
         mod.os.open, mod.os.fsync, mod.os.close = real_open, real_fsync, real_close
         if not had_flag:
@@ -483,24 +575,26 @@ def test_export_files(mod):
     # failing/half-pulled stick must surface as EXPORT FAILED, not a false
     # success papered over until the trailing os.sync() (checked above, USB
     # only), which is now just an optional final flush on top of that.
-    fsyncs = []
-    real_fsync = mod.os.fsync
-    mod.os.fsync = lambda fd: (fsyncs.append(1), real_fsync(fd))[-1]
+    fsyncs, dir_calls, restore_fsync = patch_fsync(mod)
     try:
         paths = mod.uv_export(str(d), presets, toggles, t, sync=True)
         assert calls == [1]
         assert fsyncs == [1] * len(paths), (
             "uv_export must fsync every file (S8)", fsyncs, len(paths))
+        assert len(dir_calls) == len(paths), (
+            "uv_export must fsync the directory for every file too (S7)", dir_calls)
         fsyncs.clear()
+        dir_calls.clear()
         paths2 = mod.uv_export(str(d / "nosync"), presets[:1], toggles, t)
         assert calls == [1]
         assert fsyncs == [1] * len(paths2)
+        assert len(dir_calls) == len(paths2)
     finally:
         if had_sync:
             mod.os.sync = real_sync
         else:
             del mod.os.sync
-        mod.os.fsync = real_fsync
+        restore_fsync()
     names = [Path(p).name for p in paths]
     assert names == ["uv_params_20261007-1432_FACTORY.json",
                      "uv_params_20261007-1432_14_32_07-10.json",
