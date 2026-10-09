@@ -39,8 +39,22 @@ def quat_angle_deg(a, b):
     return math.degrees(2.0 * math.acos(min(1.0, dot)))
 
 
-def run_phase(ser, parser, seconds, label, sink):
-    print(label, flush=True)
+def drain(ser, parser, seconds):
+    """Keep reading (and discarding) packets so the serial buffer stays fresh."""
+    end = time.monotonic() + seconds
+    while time.monotonic() < end:
+        parser.feed(ser.read(512))
+
+
+def run_phase(ser, parser, seconds, label, sink, get_ready=3):
+    # Give the operator time to read the next instruction and get into
+    # position before anything is recorded.
+    print("", flush=True)
+    print("NEXT / 下一步: " + label, flush=True)
+    for n in range(get_ready, 0, -1):
+        print("   get ready / 准备 ... {}".format(n), flush=True)
+        drain(ser, parser, 1.0)
+    print("   GO / 开始!", flush=True)
     end = time.monotonic() + seconds
     while time.monotonic() < end:
         chunk = ser.read(512)
@@ -73,7 +87,7 @@ def main():
     still_before, shake, still_after = [], [], []
 
     # Wait for the firmware's gyro calibration before measuring anything.
-    print("Put the probe on the table and do not touch it ...", flush=True)
+    print("Put the probe on the table and do not touch it ... / 把探头放在桌上，不要碰，等待校准 ...", flush=True)
     deadline = time.monotonic() + 30
     calibrated = False
     while time.monotonic() < deadline and not calibrated:
@@ -83,10 +97,12 @@ def main():
         print("Gyro calibration did not finish within 30 s "
               "(probe moving, or no data). Continuing anyway.")
 
-    run_phase(ser, parser, 4, "1/3  HOLD STILL (start position)", still_before.append)
-    run_phase(ser, parser, 10, "2/3  SHAKE / TWIST IT the way that causes drift", shake.append)
-    run_phase(ser, parser, 6, "3/3  PUT IT BACK EXACTLY WHERE IT STARTED and hold still",
-              still_after.append)
+    run_phase(ser, parser, 4, "1/3  HOLD STILL (start position) / 保持不动（起始位置）",
+              still_before.append)
+    run_phase(ser, parser, 10, "2/3  SHAKE / TWIST IT the way that causes drift / "
+              "像平时会漂移那样晃动", shake.append)
+    run_phase(ser, parser, 6, "3/3  PUT IT BACK EXACTLY WHERE IT STARTED and hold still / "
+              "放回原来的位置，保持不动", still_after.append, get_ready=5)
     ser.close()
 
     if not (still_before and shake and still_after):
