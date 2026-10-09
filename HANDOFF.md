@@ -135,3 +135,17 @@ PYTHONPATH=../winshim py -3 test_v604.py
 - 真实触屏下底部条和调参抽屉的点击/拖动手感；
 - 真实 U 盘插入后的 EXPORT 路径和文件；
 - 真实 UV 灯 + 这颗摄像头下的检测阈值（现在是对着 YouTube UV 视频调的，不是真实荧光光源）。
+
+## 10. v6.0.6-beta 陀螺仪饱和航向补偿（`gyro-fix` 分支）
+
+基于 6.0.5（`uv-mode`，tag `v6.0.5-stable`），**不改固件**（所有者禁止改固件）。只在主机端修复快速晃动后航向（AZ）永久偏移的问题。
+
+- **原因**：固件把 BMI270 设为 ±500 dps（`utils/bmi270/src/bmi270.cpp`）。手腕甩动超过 500 dps 时陀螺读数被截断，超出部分的转动从未进入固件 Mahony 融合。俯仰/横滚之后被重力拉回，航向（6 轴无法观测）永久丢失。所有者实测：1003 个样本中 150 个截断，放回原位后姿态差 18.9°。
+- **固件事实（从源码确认）**：包内 `gyro_dps` 是**已减去校准零偏**的值（`service_usb_imu.cpp` 的 `corrected_gyro`），所以饱和轴读数是 500 减去零点几度，判定阈值取 `|g| >= 495`；`quaternion_wxyz` 顺序 w,x,y,z，机体→世界，世界 +Z 向上（`imu_math.h` 里估计重力 `v` 就是旋转矩阵第三行，积分为 `q += 0.5·dt·q⊗ω`，右乘机体角速度）；固件 STATIONARY 时冻结融合（不调用 `update`），只做慢速零偏学习。
+- **算法**（`endoscope.py` 的 `GyroClipCompensator`）：每个轴的每段截断用两侧各 8 个未截断样本做"最小四阶差分"平滑桥接（离散五次样条），估计值不低于读数、上限 2000 dps；从第一次修补前的固件四元数起积分一个影子姿态 T（与固件完全相同的一阶积分步，用修补后的角速度，不含重力项）；输出 `R_z(航向差) ⊗ q_固件`，航向差 = T⊗q_固件⁻¹ 绕世界竖直轴的 twist。俯仰/横滚永远取固件的。固件 STATIONARY 时把 T 的倾角重新对齐到固件、保留航向。为什么不用"只取缺失转动的竖直分量"：截断同时让固件倾斜，之后重力回路绕水平轴纠正倾斜时本身会改变航向；仿真里即使角速度完全已知，只取竖直分量的 p95 误差仍有 48°，影子姿态是 1.7°。
+- **没有截断时输出就是固件四元数对象本身（逐位相同）**；按 ZERO、链路 generation 变化（重连/重启/传感器恢复）时清零。
+- **界面**：修补后状态栏显示 `CLIP+n°` 3 秒；某段截断超过 150 ms、估计触顶 2000 dps、截断中丢包，或自上次 ZERO 以来补回的转动超过 90° 时为"不确定"，弹 WARN 提示 `FAST SHAKE — HEADING MAY BE OFF, PRESS ZERO`（最多每 10 秒一次）。
+- **开关**：`~/.config/endoscope.json` 的 `"gyro_clip_compensation": false` 恢复为与 6.0.5 完全相同的路径；默认值由 `GYRO_CLIP_COMPENSATION_DEFAULT` 决定，和 `uv_tuning_panel` 一样只用 `.get()` 读取，不 setdefault。只影响 `--usb-composite`（`UsbCompositeProbeLink`）；其他链路类型和 UV 代码未改动。
+- **验证**：`tools/gyro_clip_sim.py` 用 Python 逐行移植固件（校准、StillDetector、零偏学习、Mahony Kp=2 Ki=0、0.85–1.15 g 门限、静止冻结）跑随机甩动/甩回/扭转（峰值 600–1500 dps，三种传感器截断模型）。270 次：航向误差中位数 8.3°→0.9°，p95 95°→16°；无截断 30/30 逐位相同。约 4% 的试验补偿后比固件差 1° 以上，几乎都是固件"碰巧"正反两次丢失相互抵消的情况。真实 BMI270 是在内部滤波前还是后饱和未知，"pre" 模型（滤波前饱和）效果最差（中位数 2.3°）。
+- **测试**：`PYTHONPATH=../winshim py -3 test_gyro_comp.py`（另外 5 个套件照旧）。
+- **树莓派实测**：关闭 Endoscope 后运行 `python3 tools/gyro_shake_test.py`，结果里同时有 `Heading difference (firmware)` 和 `Heading difference (compensated)`；加 `--csv shake.csv` 可保存全部数据包供离线分析（这能确定真实传感器属于哪种截断模型）。

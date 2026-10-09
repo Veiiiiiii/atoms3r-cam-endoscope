@@ -1,5 +1,35 @@
 # Changelog
 
+## 6.0.6-beta — host-side repair of heading lost to gyro saturation (branch `gyro-fix`)
+
+- Built on 6.0.5 (`uv-mode`, tag `v6.0.5-stable`). Firmware unchanged.
+- Problem: the probe's BMI270 runs at ±500 deg/s; a fast shake or flick clips,
+  the rotation above the limit never reaches the firmware fusion, and heading
+  (unobservable with 6 axes) stays wrong — 18.9° in the owner's
+  `tools/gyro_shake_test.py` run (150 of 1003 samples clipped).
+- New `GyroClipCompensator` in `endoscope.py` (USB-C composite link only):
+  bridges each clipped stretch of each gyro axis from the 8 unclipped samples
+  either side (least 4th difference, capped at 2000 deg/s), integrates a shadow
+  attitude with the firmware's own step and the repaired rates, and applies
+  only its heading difference to the firmware quaternion
+  (`R_z(heading) * q_firmware`). Pitch/roll stay the firmware's. With nothing
+  clipped the output is the firmware quaternion object itself. ZERO and a link
+  generation change reset it.
+- Live view: `CLIP+n°` in the status bar for 3 s after a repaired run; a WARN
+  toast `FAST SHAKE — HEADING MAY BE OFF, PRESS ZERO` (at most every 10 s) when
+  a run was too long / hit the cap / lost packets, or more than 90° of rotation
+  had to be put back since ZERO.
+- `endoscope.json` key `"gyro_clip_compensation"` (default true via
+  `GYRO_CLIP_COMPENSATION_DEFAULT`, read without setdefault) — false restores
+  the exact 6.0.5 behaviour.
+- Simulator `tools/gyro_clip_sim.py` (Python port of the firmware fusion):
+  270 randomised shakes/flicks/twists at 600–1500 deg/s, heading error median
+  8.3° → 0.9°, 95th percentile 95° → 16°; no-clip runs bit-identical.
+- `tools/gyro_shake_test.py` now also prints `Heading difference (firmware)`
+  and `Heading difference (compensated)`; `--csv FILE` keeps the packets.
+- Tests: new `test_gyro_comp.py`; `test_uv_presets.py` now expects
+  `"Endoscope " + APP_VER` instead of a hard-coded version.
+
 ## 6.0.5 — UV fluorescence mode on the field-approved 6.0.4 (test version)
 
 - This release is the field-approved v6.0.4 (the build actually running on the

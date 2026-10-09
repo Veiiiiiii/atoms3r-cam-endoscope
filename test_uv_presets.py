@@ -610,7 +610,7 @@ def test_export_files(mod):
         data = json.loads(Path(p).read_text(encoding="utf-8"))
         assert set(data) == fields | {"preset_name", "ref_short_side", "exported_by"}
         assert data["preset_name"] == preset["name"]
-        assert data["ref_short_side"] == 360 and data["exported_by"] == "Endoscope 6.0.5"
+        assert data["ref_short_side"] == 360 and data["exported_by"] == "Endoscope " + mod.APP_VER
         assert (data["filter_enabled"], data["boost_enabled"], data["draw_boxes"],
                 data["detect_enabled"]) == (True, False, True, True)
         assert isinstance(data["box_bgr"], list) and len(data["box_bgr"]) == 3
@@ -620,7 +620,7 @@ def test_export_files(mod):
     assert third["hue_min"] == 30 and third["sat_min"] == mod.UV_FACTORY["sat_min"]
     bundle = json.loads(Path(paths[-1]).read_text(encoding="utf-8"))
     assert [b["preset_name"] for b in bundle["presets"]] == [p["name"] for p in presets]
-    assert bundle["toggles"] == toggles and bundle["exported_by"] == "Endoscope 6.0.5"
+    assert bundle["toggles"] == toggles and bundle["exported_by"] == "Endoscope " + mod.APP_VER
     assert bundle["exported_at"] == "2026-10-07T14:32:05"
     # Detection runs whenever boost OR boxes needs it.
     p2 = mod.uv_export(str(d / "off"), presets[:1], {"boost": False, "boxes": False,

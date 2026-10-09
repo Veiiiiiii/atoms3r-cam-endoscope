@@ -126,7 +126,7 @@ from PIL import Image, ImageTk
 
 CONFIG = os.path.join(os.path.expanduser("~"), ".config", "endoscope.json")
 SYNC = b"\xa5\x5a"
-APP_VER = "6.0.5"
+APP_VER = "6.0.6-beta"
 CONFIG_REV = 6
 
 # One running instance owns /dev/video* and /dev/ttyACM*. A second launch that
@@ -163,6 +163,25 @@ USB_IMU_FLAG_STATIONARY = 1 << 3
 # leaving the app to mislabel it "connecting" while packets are flowing.
 USB_IMU_FLAG_SENSOR_FAULT = 1 << 4      # BMI270 reads failing right now
 USB_IMU_FLAG_SENSOR_RECOVERED = 1 << 5  # bus+sensor re-init just succeeded
+
+# v6.0.6 gyro clip compensation (GyroClipCompensator). The firmware sets the
+# BMI270 to +/-500 deg/s (utils/bmi270/src/bmi270.cpp) and sends gyro with its
+# calibration bias already removed, so a saturated axis reads 500 minus a
+# fraction of a degree: "clipped" is anything within 1 % of full scale.
+# Like UV_TUNING_PANEL_DEFAULT, the on/off default lives here and is only
+# read with .get() -- never frozen into a saved config by a setdefault.
+GYRO_CLIP_COMPENSATION_DEFAULT = True
+DEG2RAD = math.pi / 180.0
+GYRO_CLIP_DPS = 495.0       # |rate| at or above this is a saturated sample
+GYRO_CLIP_CAP_DPS = 2000.0  # no estimate beyond this (a hard wrist flick)
+GYRO_CLIP_CONTEXT = 8       # unclipped samples either side a bridge fits to
+GYRO_CLIP_ORDER = 4         # bridge = least 4th difference (smooth, can peak)
+GYRO_CLIP_LONG = 15         # a clipped stretch over 150 ms is "uncertain"
+GYRO_CLIP_MAX = 30          # one over 300 ms is not reconstructed at all
+GYRO_CLIP_UNSURE_DEG = 90.0  # rotation put back since ZERO beyond which the
+                             # heading is "uncertain" (simulated error ~15 %)
+GYRO_CLIP_SHOW_S = 3.0      # status-bar "CLIP+n°" stays this long
+GYRO_CLIP_WARN_EVERY_S = 10.0
 
 TYPE_IMU = 1
 TYPE_FRAME = 2
@@ -315,6 +334,297 @@ def ref_elevation(q_ref, axis_idx):
         return 0.0
     v = v_norm(q_rotate(q_ref, AXES[axis_idx][1]))
     return math.asin(clamp(v[2]))
+
+
+# ------------------------------------------------- gyro clip compensation
+
+def _fw_gyro_step(q, g_dps, dt):
+    """One step of the probe firmware's own integrator, gravity term left out
+    (imu_math.h MahonyFusion::update): q += 0.5*dt * q x (0, w), normalise.
+    The packet quaternion is (w, x, y, z), body -> world, world +Z up."""
+    gx, gy, gz = g_dps[0] * DEG2RAD, g_dps[1] * DEG2RAD, g_dps[2] * DEG2RAD
+    h = 0.5 * dt
+    w, x, y, z = q
+    w, x, y, z = (w + (-x * gx - y * gy - z * gz) * h,
+                  x + (w * gx + y * gz - z * gy) * h,
+                  y + (w * gy - x * gz + z * gx) * h,
+                  z + (w * gz + x * gy - y * gx) * h)
+    n = math.sqrt(w * w + x * x + y * y + z * z)
+    return (w / n, x / n, y / n, z / n)
+
+
+def _yaw_between(a, b):
+    """Rotation about world up (radians) in a * conj(b): its swing-twist
+    'twist' about +Z, i.e. the heading part of the attitude difference."""
+    aw, ax, ay, az = a
+    bw, bx, by, bz = b
+    dw = aw * bw + ax * bx + ay * by + az * bz
+    dz = -aw * bz - ax * by + ay * bx + az * bw
+    return 2.0 * math.atan2(dz, dw)
+
+
+def _yaw_quat(angle):
+    return (math.cos(0.5 * angle), 0.0, 0.0, math.sin(0.5 * angle))
+
+
+class GyroClipCompensator:
+    """Recover the heading a +/-500 deg/s gyro loses in a fast shake (6.0.6).
+
+    The probe firmware (service_usb_imu.cpp) fuses bias-corrected gyro and
+    gravity with a 6-axis Mahony filter and sends the result in every packet.
+    When the wrist turns faster than the BMI270's +/-500 deg/s range the gyro
+    reports the limit, the excess rotation never reaches the filter, and while
+    gravity later pulls pitch and roll back, the heading error is permanent.
+    The firmware may not be changed, so this repairs it on the host.
+
+    The firmware quaternion stays the source of truth. The output is
+    R_z(heading) * q_firmware: only a rotation about world vertical, applied in
+    the world frame (left), so elevation is never touched and the fix moves
+    the aim indicator exactly like turning the probe would.
+
+    How the heading is found:
+      * Every clipped stretch of one axis (|rate| >= GYRO_CLIP_DPS) is bridged
+        through the GYRO_CLIP_CONTEXT unclipped samples either side by the
+        smoothest curve that fits them (least 4th difference -- a discrete
+        quintic spline). The estimate never drops below the reading and is
+        capped at GYRO_CLIP_CAP_DPS.
+      * A shadow attitude T is started from the firmware quaternion just
+        before the first repaired sample and then integrated exactly like the
+        firmware integrates (same first-order step) but with the repaired
+        rates and no gravity term. T - q_firmware is the rotation the firmware
+        missed. Its twist about world up is the heading correction.
+        A plain "yaw part of the missing rotation" is not enough: the clip also
+        tilts the firmware, and the gravity loop that later levels it rotates
+        about a horizontal axis, which by itself turns the heading when the
+        tilt error is large. Tracking T keeps that in the books.
+      * While the firmware reports STATIONARY (it freezes fusion then) T is
+        re-levelled onto the firmware with its heading kept, so T's own
+        gravity-free tilt drift cannot build up.
+    Samples are processed in order once the context after them has arrived, so
+    the correction lands ~0.1 s after a clipped stretch ends.
+
+    A run (consecutive samples with any axis clipped) is "uncertain" when one
+    axis stayed clipped over GYRO_CLIP_LONG samples, an estimate hit the cap,
+    there was no context to bridge from (packet loss), or the rotation put back
+    since the last reset passed GYRO_CLIP_UNSURE_DEG. The UI then asks for a
+    re-ZERO; tools/gyro_clip_sim.py has the numbers behind these limits.
+
+    Until the first clipped sample is actually repaired, correct() returns the
+    firmware quaternion object itself, bit for bit. reset() (ZERO, link
+    generation change) returns to that state.
+    """
+
+    clip_dps = GYRO_CLIP_DPS
+    cap_dps = GYRO_CLIP_CAP_DPS
+    context = GYRO_CLIP_CONTEXT
+    order = GYRO_CLIP_ORDER
+    long_samples = GYRO_CLIP_LONG
+    max_samples = GYRO_CLIP_MAX
+    unsure_deg = GYRO_CLIP_UNSURE_DEG
+
+    def __init__(self):
+        self.events = 0             # compensated runs, ever (monotonic)
+        self.uncertain_events = 0   # runs flagged uncertain, ever (monotonic)
+        self.event_time = 0.0       # time.monotonic() of the last repaired run
+        self._generation = None
+        self.reset()
+
+    def reset(self):
+        """Forget the correction: ZERO, or a new probe epoch."""
+        self.shadow = None          # T; None = no correction (output == input)
+        self.heading = 0.0          # radians about world up, + = CCW from above
+        self.last_run_deg = 0.0
+        self.last_run_samples = 0
+        self.repaired_deg = 0.0     # rotation put back since reset, all axes
+        self.uncertain = False
+        # [t, gyro, quat, flags, clipped[3], estimate[3], resolved[3]]
+        self._buf = []
+        self._next = 0              # _buf index of the next sample for T
+        self._last = None           # (t, sequence) of the previous record
+        self._run_from = None       # heading when the current run began
+        self._run_len = 0
+        self._run_fixed = False
+        self._run_unsure = False
+
+    @property
+    def active(self):
+        return self.shadow is not None
+
+    @property
+    def offset_deg(self):
+        """Total heading correction now applied, degrees."""
+        return math.degrees(self.heading) if self.shadow is not None else 0.0
+
+    def correct(self, q):
+        if self.shadow is None:
+            return q
+        return q_mul(_yaw_quat(self.heading), q)
+
+    def update(self, record, generation=None):
+        """Feed every decoded IMU record, in order (not just the newest)."""
+        if generation is not None and generation != self._generation:
+            if self._generation is not None:
+                self.reset()
+            self._generation = generation
+        flags = record["flags"]
+        g = record.get("gyro_dps")
+        if (g is None or not (flags & USB_IMU_FLAG_VALID
+                              and flags & USB_IMU_FLAG_CALIBRATED)):
+            # The firmware is not fusing this sample (or not at all yet).
+            self._flush()
+            self._last = None
+            return
+        g = tuple(g)
+        t = record["timestamp_us"] * 1e-6
+        seq = record["sequence"]
+        if self._last is not None:
+            dt = t - self._last[0]
+            if seq != (self._last[1] + 1) & 0xffffffff or not 0.0 < dt <= 0.1:
+                self._flush()       # lost packets: their rates are unknown
+        self._last = (t, seq)
+        clipped = [abs(v) >= self.clip_dps for v in g]
+        self._buf.append([t, g, record["quaternion"], flags, clipped, list(g),
+                          [not c for c in clipped]])
+        self._resolve(False)
+        self._advance()
+
+    # -- internals ---------------------------------------------------------
+    def _flush(self):
+        if self._buf:
+            self._resolve(True)
+            self._advance()
+        if self._run_from is not None:
+            self._end_run()
+        self._buf = []
+        self._next = 0
+
+    def _resolve(self, final):
+        """Reconstruct every clipped stretch whose after-context is in."""
+        buf = self._buf
+        n = len(buf)
+        for ax in range(3):
+            i = self._next
+            while i < n:
+                if buf[i][6][ax]:
+                    i += 1
+                    continue
+                start = i
+                while i < n and buf[i][4][ax]:
+                    i += 1
+                if not final and i >= n:
+                    if n - start > self.max_samples:
+                        self._solve(ax, start, n - 1)   # endless: give up on it
+                    break
+                if not final and n - i < self.context:
+                    break
+                self._solve(ax, start, i - 1)
+
+    def _solve(self, ax, start, end):
+        buf = self._buf
+        length = end - start + 1
+        estimate = None
+        unsure = length > self.long_samples
+        if length <= self.max_samples:
+            lo = max(0, start - self.context)
+            hi = min(len(buf), end + 1 + self.context)
+            vals = np.array([buf[i][1][ax] for i in range(lo, hi)])
+            known = np.array([not buf[i][4][ax] for i in range(lo, hi)])
+            if (known[:start - lo].sum() >= 2 and known[end + 1 - lo:].sum() >= 2
+                    and hi - lo > self.order):
+                # Least-squares smoothest bridge: minimise the sum of squared
+                # order-th differences over the window, known samples fixed.
+                diff = np.diff(np.eye(hi - lo), self.order, axis=0)
+                unk = np.flatnonzero(~known)
+                kn = np.flatnonzero(known)
+                sol = np.linalg.lstsq(diff[:, unk], -diff[:, kn] @ vals[kn],
+                                      rcond=None)[0]
+                vals[unk] = sol
+                estimate = vals[start - lo:end + 1 - lo]
+        if estimate is None:
+            unsure = True
+        for k, i in enumerate(range(start, end + 1)):
+            meas = buf[i][1][ax]
+            if estimate is not None:
+                sign = 1.0 if meas > 0 else -1.0
+                mag = sign * float(estimate[k])
+                if mag > self.cap_dps:
+                    mag = self.cap_dps
+                    unsure = True
+                if mag > abs(meas):
+                    buf[i][5][ax] = sign * mag
+                    dt = buf[i][0] - buf[i - 1][0] if i else 0.01
+                    self.repaired_deg += (mag - abs(meas)) * dt
+            buf[i][6][ax] = True
+        if unsure:
+            self._run_unsure = True
+
+    def _advance(self):
+        """Move T forward over every sample that is fully resolved."""
+        buf = self._buf
+        while self._next < len(buf) and all(buf[self._next][6]):
+            t, g, q, flags, clipped, est, _ = buf[self._next]
+            prev = buf[self._next - 1] if self._next else None
+            fixed = est != list(g)
+            if any(clipped):
+                if self._run_from is None:
+                    self._run_from = self.heading
+                    self._run_len = 0
+                self._run_len += 1
+                if fixed and self.shadow is None:
+                    if prev is None:
+                        self._run_unsure = True     # nothing to start T from
+                    else:
+                        self.shadow = prev[2]
+                self._run_fixed = self._run_fixed or fixed
+            if self.shadow is not None:
+                if flags & USB_IMU_FLAG_STATIONARY:
+                    # Firmware holds still and its tilt has settled on
+                    # gravity: re-level T onto it, keep the heading.
+                    self.shadow = q_mul(_yaw_quat(_yaw_between(self.shadow, q)), q)
+                elif prev is None:
+                    # After a gap: carry the heading over to the new data.
+                    self.shadow = q_mul(_yaw_quat(self.heading), q)
+                else:
+                    self.shadow = _fw_gyro_step(self.shadow, est, t - prev[0])
+                self.heading = _yaw_between(self.shadow, q)
+            if not any(clipped) and self._run_from is not None:
+                self._end_run()
+            self._next += 1
+        # Keep `context` samples (plus the previous one) behind the pointer.
+        excess = self._next - self.context - 1
+        if excess > 0:
+            del buf[:excess]
+            self._next -= excess
+
+    def _end_run(self):
+        change = self.heading - self._run_from
+        self.last_run_deg = math.degrees(math.atan2(math.sin(change),
+                                                    math.cos(change)))
+        self.last_run_samples = self._run_len
+        if self._run_fixed:
+            self.events += 1
+            self.event_time = time.monotonic()
+            # Each bridge is an estimate; their errors add up with how much
+            # rotation they had to supply (about 15 % of it in simulation).
+            if self.repaired_deg > self.unsure_deg:
+                self._run_unsure = True
+        if self._run_unsure:
+            self.uncertain = True
+            self.uncertain_events += 1
+        self._run_from = None
+        self._run_fixed = False
+        self._run_unsure = False
+
+    def status(self):
+        return {"active": self.shadow is not None,
+                "offset_deg": self.offset_deg,
+                "last_run_deg": self.last_run_deg,
+                "last_run_samples": self.last_run_samples,
+                "repaired_deg": self.repaired_deg,
+                "uncertain": self.uncertain,
+                "events": self.events,
+                "uncertain_events": self.uncertain_events,
+                "event_time": self.event_time}
 
 
 # ---------------------------------------------------- lens-axis detection
@@ -1139,6 +1449,12 @@ class UsbCompositeProbeLink:
         self.parser = UsbImuPacketParser()
         self.lock = threading.Lock()
         self.quat = (1.0, 0.0, 0.0, 0.0)
+        # 6.0.6: quat is the firmware quaternion with the gyro-clip heading
+        # repair applied (identical object when there is nothing to repair);
+        # fw_quat is the untouched one. App sets clip_comp to None when the
+        # "gyro_clip_compensation" config key is false.
+        self.fw_quat = self.quat
+        self.clip_comp = GyroClipCompensator()
         self.still = False
         self.last_imu = None
         self.last_sequence = None
@@ -1251,7 +1567,7 @@ class UsbCompositeProbeLink:
                                 with self.lock:
                                     self.generation += 1
                                 first_packet = False
-                            self._publish(record)
+                            self._publish(record, records[:-1])
                     # Judge health from valid packets, not arbitrary bytes. The
                     # ignored heartbeat also wakes the firmware's USB-owner pump.
                     now = time.monotonic()
@@ -1294,7 +1610,7 @@ class UsbCompositeProbeLink:
                     time.sleep(backoff)
                     backoff = min(backoff * 2.0, 4.0)
 
-    def _publish(self, record):
+    def _publish(self, record, older=()):
         sequence = record["sequence"]
         if self.last_sequence is not None:
             gap = (sequence - self.last_sequence - 1) & 0xffffffff
@@ -1330,6 +1646,23 @@ class UsbCompositeProbeLink:
             if recovered and not self._recovered_prev:
                 self.generation += 1
             self._recovered_prev = recovered
+            # 6.0.6: the clip compensator needs EVERY record in order (a
+            # clipped stretch is only visible sample by sample), including
+            # the older ones of this read that are otherwise not published.
+            # It resets itself when the generation changes.
+            self.fw_quat = record["quaternion"]
+            comp = self.clip_comp
+            if comp is not None:
+                for older_record in older:
+                    comp.update(older_record, self.generation)
+                comp.update(record, self.generation)
+                self.quat = comp.correct(self.fw_quat)
+
+    def reset_clip_comp(self):
+        """ZERO: forget the clip correction. Caller holds self.lock."""
+        if self.clip_comp is not None:
+            self.clip_comp.reset()
+        self.quat = self.fw_quat
 
     def snapshot(self):
         frame, sequence, _ = self.camera.snapshot()
@@ -1367,6 +1700,8 @@ class UsbCompositeProbeLink:
                 "imu_reconnects": self.imu_reconnects,
                 "last_imu_error": self.last_imu_error,
                 "port": self.port,
+                "clip": (self.clip_comp.status()
+                         if self.clip_comp is not None else None),
             }
 
     # The v1 USB protocol is telemetry-only; UI legacy commands are disabled.
@@ -3525,6 +3860,7 @@ class App:
         self.video_flip_v = bool(self.cfg.get("video_flip_v", False))
         self.video_flip_h_btn = None
         self.video_flip_v_btn = None
+        self._gyro_clip_setup()
         # UV fluorescence mode (6.0.5). Always boots OFF (D7): whatever was on
         # when the device was last switched off, the operator first gets the
         # plain picture. Only the three bar toggles are remembered, and a
@@ -4027,6 +4363,41 @@ class App:
 
     # ---- zero capture, shared by every stage
 
+    def _gyro_clip_setup(self):
+        """6.0.6 gyro clip compensation (USB-C composite link only). The key
+        is read like uv_tuning_panel (R6): .get() with the module default,
+        never a setdefault, and a damaged value falls back to the default."""
+        try:
+            self.gyro_clip_comp = _uv_bool(self.cfg.get(
+                "gyro_clip_compensation", GYRO_CLIP_COMPENSATION_DEFAULT))
+        except (TypeError, ValueError, OverflowError):
+            self.gyro_clip_comp = GYRO_CLIP_COMPENSATION_DEFAULT
+        if "gyro_clip_compensation" in self.cfg:
+            self.cfg["gyro_clip_compensation"] = self.gyro_clip_comp
+        if not self.gyro_clip_comp and hasattr(self.link, "reset_clip_comp"):
+            with self.link.lock:
+                self.link.reset_clip_comp()
+                self.link.clip_comp = None  # off: exactly the 6.0.5 path
+        self._clip_unsure_seen = 0          # uncertain_events already warned of
+        self._clip_warn_t = -1e9            # monotonic time of the last warning
+
+    def _gyro_clip_status(self, h, bits):
+        """Live view: "CLIP+n°" for a few seconds after a repaired run, and
+        one WARN toast per GYRO_CLIP_WARN_EVERY_S when a run was uncertain."""
+        clip = h.get("clip")
+        if not clip:
+            return
+        now = time.monotonic()
+        if clip["events"] and now - clip["event_time"] < GYRO_CLIP_SHOW_S:
+            bits.append("CLIP{:+.0f}°".format(clip["last_run_deg"]))
+        if clip["uncertain_events"] != getattr(self, "_clip_unsure_seen", 0):
+            self._clip_unsure_seen = clip["uncertain_events"]
+            if (clip["uncertain"] and now - getattr(self, "_clip_warn_t", -1e9)
+                    >= GYRO_CLIP_WARN_EVERY_S):
+                self._clip_warn_t = now
+                self.toast("FAST SHAKE — HEADING MAY BE OFF, PRESS ZERO",
+                           WARN, ms=2500)
+
     def link_ready(self):
         h = self.link.health()
         return (h["state"] == "online" and h["imu_age"] < 1.0
@@ -4042,6 +4413,10 @@ class App:
                          and not self.link.calibrating
                          and time.monotonic() - self.link.imu_time < 1.0)
                 still = self.link.still
+                if ready and hasattr(self.link, "reset_clip_comp"):
+                    # 6.0.6: a new zero is a fresh heading; any gyro-clip
+                    # correction before it is folded into this reference.
+                    self.link.reset_clip_comp()
                 q, generation = self.link.quat, self.link.generation
             if not ready:
                 self.toast("PROBE NOT READY", WARN)
@@ -6016,6 +6391,7 @@ class App:
                 bits.append("{} bad pkts".format(h["bad"]))
             if h.get("dropped"):
                 bits.append("{} IMU drops".format(h["dropped"]))
+            self._gyro_clip_status(h, bits)
             self.canvas.itemconfigure(self.statusbar, text="    ".join(bits))
 
         self.root.after(40, self.update)
