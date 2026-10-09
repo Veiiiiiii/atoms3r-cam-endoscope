@@ -183,6 +183,22 @@ def test_edges():
     gap = E.GyroClipCompensator()
     hump(gap, True)
     assert gap.uncertain and not gap.active
+    # Packets lost during a 90 deg turn, then a STATIONARY packet: the gap
+    # (rebase, keep the heading correction) comes before the stationary
+    # re-level, which used to wipe the correction and leave it at ~-80 deg.
+    comp = E.GyroClipCompensator()
+    probe = Probe(comp)
+    for v in [0] * 10 + true + [0] * 12:
+        probe.send((0, 0, min(v, 499.9)))
+    before = comp.offset_deg
+    assert comp.active and before > 3.0, before
+    q_turned = tuple(E.q_mul(yaw_quat(90.0), np.array(probe.q)))
+    st = VALID | E.USB_IMU_FLAG_STATIONARY
+    for k in range(4):
+        comp.update(record(probe.seq + 30 + k, (probe.seq + 30 + k) * 10000,
+                           (0, 0, 0), q_turned, flags=st), 1)
+        assert abs(comp.offset_deg - before) < 1e-6, (k, comp.offset_deg, before)
+    assert comp.active and not comp.uncertain
     # Records without rate data (old test doubles) or not yet calibrated are
     # simply not used.
     comp = E.GyroClipCompensator()
@@ -194,6 +210,67 @@ def test_edges():
           "short hump bridged ({:+.2f} deg put back, {:.2f} lost); packet gap "
           "mid-clip -> uncertain, nothing invented; uncalibrated/rateless "
           "records ignored".format(ok.last_run_deg, lost))
+
+
+# ------------------------------------------------------- SHAKE TEST TOOL
+def test_shake_headings():
+    # tools/gyro_shake_test.py reports heading differences in (-180, 180]:
+    # a quaternion sign flip or a full turn is 0, not ~360.
+    spec = importlib.util.spec_from_file_location(
+        "gyro_shake_test_mod", HERE / "tools" / "gyro_shake_test.py")
+    shake = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(shake)
+    for d, want in ((0, 0), (360, 0), (-180, 180), (180, 180), (190, -170),
+                    (-190, 170), (720.5, 0.5)):
+        assert abs(shake.wrap_deg(d) - want) < 1e-9, (d, shake.wrap_deg(d))
+    q = yaw_quat(30.0)
+    assert abs(shake.heading_deg(q, q)) < 1e-9
+    assert abs(shake.heading_deg(-q, q)) < 1e-6          # same attitude, -q
+    assert abs(shake.heading_deg(q, -q)) < 1e-6
+    assert abs(shake.heading_deg(yaw_quat(350.0), yaw_quat(0.0)) + 10.0) < 1e-6
+    assert abs(shake.heading_deg(yaw_quat(170.0), yaw_quat(-170.0)) + 20.0) < 1e-6
+    print("PASS: SHAKE TEST -- heading differences wrapped to (-180, 180] "
+          "(sign flip / full turn -> 0)")
+
+
+# ----------------------------------------------------------- DETECTION
+def test_detection():
+    # Genuine fast motion that never saturates: Z ramps 0..490 dps, ten
+    # samples at 497, ramps down. The old 495 dps threshold took the 497s for
+    # a clip and invented ~15.8 deg of heading; nothing may be repaired now.
+    comp = E.GyroClipCompensator()
+    probe = Probe(comp)
+    for v in list(range(0, 491, 70)) + [497.0] * 10 + list(range(490, -1, -70)) + [0] * 12:
+        probe.send((0, 0, v))
+    assert not comp.active and comp.events == 0 and not comp.uncertain
+    assert comp.repaired_deg == 0.0 and comp.offset_deg == 0.0
+    q = (1.0, 0.0, 0.0, 0.0)
+    assert comp.correct(q) is q
+    # Near full scale but still moving (not a plateau): no clip either.
+    comp = E.GyroClipCompensator()
+    probe = Probe(comp)
+    for v in [300.0, 450.0, 498.6, 499.2, 499.7, 499.1, 498.8, 440.0, 300.0] + [0] * 12:
+        probe.send((0, 0, v))
+    assert not comp.active and comp.events == 0 and comp.repaired_deg == 0.0
+    # A true plateau (bias 0.1 -> 499.9, as the packet reads) whose neighbours
+    # happen to read 498.9 / 498.7 is still repaired: edges are released.
+    comp = E.GyroClipCompensator()
+    probe = Probe(comp)
+    big = [898.0 * math.sin(math.pi * i / 16) for i in range(17)]
+    big[3], big[13] = 498.9, 498.7              # real, just below full scale
+    for v in [0] * 10 + [499.9 if 499.0 < v else v for v in big] + [0] * 12:
+        probe.send((0, 0, v))
+    assert comp.active and comp.events == 1 and comp.last_run_deg > 3.0
+    # Negative saturation (-500.0 raw minus bias) behaves the same.
+    comp = E.GyroClipCompensator()
+    probe = Probe(comp)
+    true = [640 * math.sin(math.pi * i / 12) for i in range(13)]
+    for v in [0] * 10 + [-min(v, 500.2) for v in true] + [0] * 12:
+        probe.send((0, 0, v))
+    assert comp.active and comp.events == 1 and comp.last_run_deg < -3.0
+    print("PASS: DETECTION -- 497 dps unclipped ramp and non-flat 498.6-499.7 "
+          "runs left alone; flat plateau repaired (edge samples released), "
+          "both signs")
 
 
 # -------------------------------------------------------------------- RESET
@@ -347,8 +424,8 @@ def test_simulator():
           "p95 {:.2f} -> {:.2f} deg, {} worse by >1 deg".format(
               s["n"], s["fw_med"], s["comp_med"], s["fw_p95"], s["comp_p95"],
               s["worse"]))
-    # Regression bounds (this seed measured 6.8 -> 0.37 median, 56 -> 7.3 p95,
-    # none worse).
+    # Regression bounds (this seed measured 6.8 -> 0.39 median, 56 -> 9.0 p95,
+    # 1 worse).
     assert s["fw_med"] > 4.0 and s["fw_p95"] > 40.0      # the problem is real
     assert s["comp_med"] < 0.3 * s["fw_med"], s
     assert s["comp_p95"] < 0.4 * s["fw_p95"], s
@@ -365,6 +442,8 @@ def main():
     test_single_axis()
     test_multi_axis()
     test_edges()
+    test_detection()
+    test_shake_headings()
     test_reset()
     test_config()
     test_status()

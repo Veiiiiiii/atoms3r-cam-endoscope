@@ -47,9 +47,17 @@ def quat_angle_deg(a, b):
     return math.degrees(2.0 * math.acos(min(1.0, dot)))
 
 
+def wrap_deg(d):
+    """Normalise an angle to (-180, 180] degrees."""
+    d = (d + 180.0) % 360.0 - 180.0
+    return 180.0 if d == -180.0 else d
+
+
 def heading_deg(a, b):
-    """Rotation about world vertical from attitude b to attitude a, degrees."""
-    return math.degrees(endoscope._yaw_between(a, b))
+    """Rotation about world vertical from attitude b to attitude a, degrees,
+    in (-180, 180]. A quaternion sign flip or a full turn must not show up
+    as ~360 degrees of error."""
+    return wrap_deg(math.degrees(endoscope._yaw_between(a, b)))
 
 
 def drain(ser, parser, seconds, feed):

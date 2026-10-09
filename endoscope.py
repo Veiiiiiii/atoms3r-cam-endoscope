@@ -167,12 +167,21 @@ USB_IMU_FLAG_SENSOR_RECOVERED = 1 << 5  # bus+sensor re-init just succeeded
 # v6.0.6 gyro clip compensation (GyroClipCompensator). The firmware sets the
 # BMI270 to +/-500 deg/s (utils/bmi270/src/bmi270.cpp) and sends gyro with its
 # calibration bias already removed, so a saturated axis reads 500 minus a
-# fraction of a degree: "clipped" is anything within 1 % of full scale.
+# fraction of a degree. The firmware's calibration accepts a window only when
+# the raw rate magnitude is <= 1 dps and its learner keeps the bias within
+# 0.5 dps of that, so |bias| <= 1.5 dps per axis and a saturated axis reads at
+# least 499.98 - 1.5 = 498.48 dps. "Clipped" is therefore >= 498.4 dps (a looser
+# 495 mistook fast but genuine, unclipped motion for clipping), and a run of
+# two or more such samples must also be flat: saturated raw counts are pinned
+# and the bias is constant, so those samples agree to within noise/rounding
+# (a quarter dps, loose enough for the simulator's worst sensor model), whereas
+# real motion near full scale keeps changing.
 # Like UV_TUNING_PANEL_DEFAULT, the on/off default lives here and is only
 # read with .get() -- never frozen into a saved config by a setdefault.
 GYRO_CLIP_COMPENSATION_DEFAULT = True
 DEG2RAD = math.pi / 180.0
-GYRO_CLIP_DPS = 495.0       # |rate| at or above this is a saturated sample
+GYRO_CLIP_DPS = 498.4       # |rate| at or above this may be a saturated sample
+GYRO_CLIP_FLAT_DPS = 0.25   # saturated samples of one run agree within this
 GYRO_CLIP_CAP_DPS = 2000.0  # no estimate beyond this (a hard wrist flick)
 GYRO_CLIP_CONTEXT = 8       # unclipped samples either side a bridge fits to
 GYRO_CLIP_ORDER = 4         # bridge = least 4th difference (smooth, can peak)
@@ -415,6 +424,7 @@ class GyroClipCompensator:
     """
 
     clip_dps = GYRO_CLIP_DPS
+    flat_dps = GYRO_CLIP_FLAT_DPS
     cap_dps = GYRO_CLIP_CAP_DPS
     context = GYRO_CLIP_CONTEXT
     order = GYRO_CLIP_ORDER
@@ -519,8 +529,32 @@ class GyroClipCompensator:
                     break
                 self._solve(ax, start, i - 1)
 
+    def _plateau(self, ax, start, end):
+        """Narrow a candidate clipped stretch to its saturated samples. Those
+        all sit at the stretch's extreme value (the full-scale reading); any
+        other sample is real, merely fast, motion and is released as unclipped
+        (it then constrains the bridge as a known value). A stretch of two or
+        more samples with no two at that value was not saturation at all.
+        Returns the (start, end) to reconstruct; end < start when none."""
+        buf = self._buf
+        vals = [buf[i][1][ax] for i in range(start, end + 1)]
+        ref = max(vals, key=abs)
+        flat = [abs(v - ref) <= self.flat_dps for v in vals]
+        if len(vals) > 1 and sum(flat) < 2:
+            flat = [False] * len(vals)
+        for i, f in enumerate(flat, start):
+            if not f:
+                buf[i][4][ax] = False       # not saturated after all
+                buf[i][6][ax] = True
+        if True not in flat:
+            return start, start - 1
+        return start + flat.index(True), end - flat[::-1].index(True)
+
     def _solve(self, ax, start, end):
         buf = self._buf
+        start, end = self._plateau(ax, start, end)
+        if end < start:
+            return
         length = end - start + 1
         estimate = None
         unsure = length > self.long_samples
@@ -577,13 +611,14 @@ class GyroClipCompensator:
                         self.shadow = prev[2]
                 self._run_fixed = self._run_fixed or fixed
             if self.shadow is not None:
-                if flags & USB_IMU_FLAG_STATIONARY:
+                if prev is None:
+                    # After a gap: carry the heading over to the new data
+                    # (first, so a stationary packet cannot erase it).
+                    self.shadow = q_mul(_yaw_quat(self.heading), q)
+                elif flags & USB_IMU_FLAG_STATIONARY:
                     # Firmware holds still and its tilt has settled on
                     # gravity: re-level T onto it, keep the heading.
                     self.shadow = q_mul(_yaw_quat(_yaw_between(self.shadow, q)), q)
-                elif prev is None:
-                    # After a gap: carry the heading over to the new data.
-                    self.shadow = q_mul(_yaw_quat(self.heading), q)
                 else:
                     self.shadow = _fw_gyro_step(self.shadow, est, t - prev[0])
                 self.heading = _yaw_between(self.shadow, q)
